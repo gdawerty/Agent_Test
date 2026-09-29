@@ -994,11 +994,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=default_model,
         help="Model name (default depends on the provider)",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print selected provider, model, and maximum step count",
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.verbose:
+        print(f"Provider: {args.provider}")
+        print(f"Model: {args.model}")
+        print(f"Max steps: {args.max_steps}")
     if args.issue_number is None:
         parser = build_parser()
         parser.print_usage()

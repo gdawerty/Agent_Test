@@ -206,6 +206,7 @@ class AgentTests(unittest.TestCase):
 
             self.assertEqual(result.steps, 1)
             self.assertIn("final tests", result.final_message)
+            self.assertIn("app.py", result.final_message)
             self.assertEqual(
                 (root / "app.py").read_text(encoding="utf-8"),
                 "VALUE = 'fixed'\n",

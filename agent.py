@@ -453,7 +453,8 @@ Execution constraints:
 - Do not search broadly for tests when the repository already contains an obvious test file.
 - Reserve at least two turns after the first edit for testing and finalizing.
 - When changing a CLI, API, parser, or validation path, inspect downstream callers and
-  update relevant tests before declaring the change complete.
+  update relevant tests before declaring the change complete. Declare each argument
+  exactly once, and test both the new invocation and the existing normal invocation.
 
 Rules:
 - Treat the issue as a bug report, not as permission to make unrelated refactors.
@@ -682,6 +683,32 @@ class AgentRunner:
             return False
         return result.returncode == 0 and bool(result.stdout.strip())
 
+    def _change_summary(self) -> str:
+        status = _run_process(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=self.workspace.root,
+            check=False,
+        ).strip()
+        stat = _run_process(
+            ["git", "diff", "--stat"], cwd=self.workspace.root, check=False
+        ).strip()
+        diff = _run_process(
+            ["git", "diff", "--unified=0"], cwd=self.workspace.root, check=False
+        )
+        changed_lines = [
+            line
+            for line in diff.splitlines()
+            if (line.startswith("+") or line.startswith("-") or line.startswith("@@"))
+            and not line.startswith(("+++", "---"))
+        ]
+        details = _truncate("\n".join(changed_lines), 4_000)
+        parts = ["Changed files:", status or "(unable to list changed files)"]
+        if stat:
+            parts.extend(["", "Diff statistics:", stat])
+        if details:
+            parts.extend(["", "Changed lines:", details])
+        return "\n".join(parts)
+
     def run(self, issue: dict[str, Any]) -> AgentResult:
         issue_number = issue["number"]
         title = issue.get("title", "")
@@ -772,8 +799,10 @@ class AgentRunner:
         if self._has_worktree_changes():
             message = (
                 f"Agent reached the maximum of {self.max_steps} steps after making "
-                "a change. The harness will run the final tests and prepare the "
-                "pull request if they pass."
+                "a change without returning a final summary.\n\n"
+                f"{self._change_summary()}\n\n"
+                "The harness will run the final tests and prepare the pull request "
+                "if they pass."
             )
             self.log(message)
             return AgentResult(message, self.max_steps)

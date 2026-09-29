@@ -37,6 +37,11 @@ jobs:
       - name: Install agent dependency
         run: python -m pip install -r requirements.txt
 
+      - name: Configure Git
+        run: |
+          git config user.name "gdawerty"
+          git config user.email "aaronluutri@gmail.com"
+
       - name: Run issue agent
         env:
           GH_TOKEN: ${{ github.token }}

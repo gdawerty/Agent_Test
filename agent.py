@@ -966,7 +966,12 @@ def build_parser() -> argparse.ArgumentParser:
         default_model = os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("issue_number", type=int, help="GitHub issue number to fix")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version="GitHub issue agent MVP",
+    )
+    parser.add_argument("issue_number", type=int, nargs="?", help="GitHub issue number to fix")
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -994,6 +999,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.issue_number is None:
+        parser = build_parser()
+        parser.print_usage()
+        return 1
     if args.issue_number <= 0:
         raise AgentError("issue_number must be positive")
     if args.max_steps <= 0:

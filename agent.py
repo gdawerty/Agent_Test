@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Hi
 """Small GitHub issue-to-PR coding agent.
 
 The model can inspect and edit the checkout through a deliberately small tool

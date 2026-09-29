@@ -28,7 +28,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.6"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
-MAX_STEPS = 8
+MAX_STEPS = 10
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
 IGNORED_DIRECTORIES = {
@@ -437,7 +437,8 @@ TOOLS: list[dict[str, Any]] = [
 SYSTEM_PROMPT = """
 You are a careful software engineering agent fixing one GitHub issue.
 
-Use the limited tool turns efficiently:
+You have a limited number of tool turns, so reserve enough turns to edit, test,
+and finish:
 1. Call list_files once only if you need repository orientation.
 2. Use search_code to locate the relevant symbol or behavior. Search results include
    line numbers and nearby context.
@@ -445,13 +446,19 @@ Use the limited tool turns efficiently:
    Do not reread an entire large file from the beginning. The returned lines are
    prefixed with line numbers for navigation; omit those prefixes when copying
    old_text or new_text for edit_file.
-4. Inspect the relevant tests, then make one focused edit with edit_file. For an
+4. Inspect the relevant tests if needed, then make one focused edit with edit_file. For an
    existing file, copy a unique exact block into old_text and put only the replacement
    in new_text. Use an empty old_text only to create a new file.
-5. Run the tests once after the edit. If they fail because of your change, make the
+   If the change affects a CLI, API, parser, or validation path, inspect its downstream
+   callers and update the relevant tests before declaring it complete.
+5. Do not run the test suite before making an edit unless the issue specifically
+   requires reproducing an existing failure.
+6. Run the tests once after the edit. If they fail because of your change, make the
    smallest follow-up edit and run them again.
-6. Stop as soon as the issue is fixed and the tests pass, or give a concrete reason
-   why it cannot be fixed.
+7. After the tests pass, immediately return your final summary. Do not use another
+   tool to reread or recheck code you already inspected.
+8. If the issue cannot be fixed, stop with a concrete explanation rather than
+   spending the remaining turns exploring unrelated code.
 
 Rules:
 - Treat the issue as a bug report, not as permission to make unrelated refactors.

@@ -24,7 +24,7 @@ gh auth login
 export GEMINI_API_KEY="your-gemini-key"
 ```
 
-Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most eight model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
+Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most ten model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
 
 ```bash
 export LLM_PROVIDER=openai

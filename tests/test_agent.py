@@ -53,6 +53,15 @@ class ScriptedModel:
 
 
 class AgentTests(unittest.TestCase):
+    def test_verbose_flag(self):
+        from agent import build_parser
+        parser = build_parser()
+        args = parser.parse_args(["12", "--verbose", "--provider", "gemini", "--model", "gemini-model", "--max-steps", "15"])
+        self.assertTrue(args.verbose)
+        self.assertEqual(args.provider, "gemini")
+        self.assertEqual(args.model, "gemini-model")
+        self.assertEqual(args.max_steps, 15)
+
     def test_gemini_thought_signature_is_preserved(self):
         signature = "encrypted-signature"
         raw_call = SimpleNamespace(

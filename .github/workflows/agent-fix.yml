@@ -16,8 +16,8 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: agent-issue-${{ github.event.issue.number || inputs.issue_number }}
-  cancel-in-progress: false
+  group: agent-fix-gemini
+  queue: max
 
 jobs:
   fix:
@@ -46,4 +46,4 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5.6' }}
           ISSUE_NUMBER: ${{ github.event.inputs.issue_number || github.event.issue.number }}
-        run: python agent.py "$ISSUE_NUMBER"
+        run: python agent.py "$ISSUE_NUMBER" --max-steps 8

@@ -206,6 +206,9 @@ tempCodeRunnerFile.py
 # Ruff stuff:
 .ruff_cache/
 
+# macOS Finder metadata
+.DS_Store
+
 # PyPI configuration file
 .pypirc
 

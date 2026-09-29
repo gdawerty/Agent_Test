@@ -11,9 +11,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,9 +26,10 @@ DEFAULT_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_MODEL = "gpt-5.6"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-MAX_TOOL_OUTPUT = 20_000
-MAX_FILE_OUTPUT = 50_000
-MAX_STEPS = 20
+MAX_TOOL_OUTPUT = 8_000
+MAX_FILE_OUTPUT = 8_000
+MAX_STEPS = 8
+GEMINI_REQUEST_DELAY_SECONDS = 5.0
 IGNORED_DIRECTORIES = {
     ".git",
     ".venv",
@@ -48,6 +51,20 @@ def _truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + f"\n...[truncated at {limit} characters]"
+
+
+def _rate_limit_delay(error: Exception) -> float | None:
+    """Return a retry delay for a recoverable per-minute rate-limit error."""
+    message = str(error)
+    if "429" not in message and "rate" not in message.lower():
+        return None
+
+    match = re.search(r"retry in\s+([0-9]+(?:\.[0-9]+)?)s", message, re.IGNORECASE)
+    if match:
+        return min(float(match.group(1)) + 1.0, 120.0)
+    if "perminute" in message.lower() or "per minute" in message.lower():
+        return 60.0
+    return None
 
 
 def _item_value(item: Any, name: str, default: Any = None) -> Any:
@@ -137,13 +154,32 @@ class RepoWorkspace:
             return f"ERROR: {path} is not a UTF-8 text file"
         return _truncate(content, MAX_FILE_OUTPUT)
 
-    def write_file(self, path: str, content: str) -> str:
+    def edit_file(self, path: str, old_text: str, new_text: str) -> str:
         target = self._safe_path(path)
-        if len(content) > 1_000_000:
-            raise ValueError("Refusing to write a file larger than 1 MB")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        return f"Successfully wrote {path} ({len(content)} characters)"
+        if len(new_text) > 1_000_000:
+            raise ValueError("Refusing to write more than 1 MB")
+
+        if not target.exists():
+            if old_text:
+                return "ERROR: file does not exist; use an empty old_text to create it"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(new_text, encoding="utf-8")
+            return f"Successfully created {path} ({len(new_text)} characters)"
+
+        if not target.is_file():
+            return f"ERROR: {path} is not a file"
+        if not old_text:
+            return "ERROR: old_text must be non-empty when editing an existing file"
+
+        content = target.read_text(encoding="utf-8")
+        occurrences = content.count(old_text)
+        if occurrences == 0:
+            return "ERROR: old_text was not found; read the file again and include more context"
+        if occurrences > 1:
+            return "ERROR: old_text occurs more than once; provide more context"
+
+        target.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
+        return f"Successfully edited {path}"
 
     def search_code(self, query: str) -> str:
         if not query:
@@ -273,7 +309,7 @@ class RepoWorkspace:
             "list_files": self.list_files,
             "read_file": self.read_file,
             "search_code": self.search_code,
-            "write_file": self.write_file,
+            "edit_file": self.edit_file,
             "run_tests": self.run_tests,
         }
         handler = handlers.get(name)
@@ -321,15 +357,19 @@ TOOLS: list[dict[str, Any]] = [
     },
     {
         "type": "function",
-        "name": "write_file",
-        "description": "Replace a complete UTF-8 text file in the repository with new content.",
+        "name": "edit_file",
+        "description": (
+            "Make one exact replacement in an existing UTF-8 file. "
+            "Use an empty old_text only when creating a new file."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
-                "content": {"type": "string"},
+                "old_text": {"type": "string"},
+                "new_text": {"type": "string"},
             },
-            "required": ["path", "content"],
+            "required": ["path", "old_text", "new_text"],
             "additionalProperties": False,
         },
     },
@@ -354,7 +394,9 @@ Work methodically:
 1. Inspect the repository and identify the relevant code.
 2. Search for symbols or behavior named by the issue.
 3. Read the smallest set of relevant files.
-4. Make the smallest reasonable fix with write_file.
+4. Make the smallest reasonable fix with edit_file. For an existing file,
+   copy a unique exact block into old_text and put only the replacement in
+   new_text. Use an empty old_text only to create a new file.
 5. Run the tests. If they fail because of your change, investigate and fix them.
 6. Stop using tools only when the issue is fixed or you have a concrete explanation
    of why it cannot be fixed.
@@ -564,11 +606,13 @@ class AgentRunner:
         model: Model,
         *,
         max_steps: int = MAX_STEPS,
+        request_delay: float = 0.0,
         log: Callable[[str], None] = print,
     ):
         self.workspace = workspace
         self.model = model
         self.max_steps = max_steps
+        self.request_delay = max(0.0, request_delay)
         self.log = log
 
     def run(self, issue: dict[str, Any]) -> AgentResult:
@@ -589,11 +633,25 @@ class AgentRunner:
 
         for step in range(1, self.max_steps + 1):
             self.log(f"\n--- Agent step {step} ---")
-            response = self.model.create(
-                instructions=SYSTEM_PROMPT,
-                input_items=input_items,
-                tools=TOOLS,
-            )
+            if step > 1 and self.request_delay:
+                time.sleep(self.request_delay)
+
+            for attempt in range(2):
+                try:
+                    response = self.model.create(
+                        instructions=SYSTEM_PROMPT,
+                        input_items=input_items,
+                        tools=TOOLS,
+                    )
+                    break
+                except Exception as exc:
+                    retry_delay = _rate_limit_delay(exc)
+                    if retry_delay is None or attempt == 1:
+                        raise
+                    self.log(
+                        f"Rate limited; waiting {retry_delay:.1f}s before retrying"
+                    )
+                    time.sleep(retry_delay)
             output_items = list(_item_value(response, "output", []) or [])
             input_items.extend(output_items)
 
@@ -782,6 +840,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         workspace,
         create_model(args.provider, args.model),
         max_steps=args.max_steps,
+        request_delay=(
+            float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
+            if args.provider == "gemini"
+            else 0.0
+        ),
     )
     result = runner.run(issue)
 

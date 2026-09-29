@@ -24,7 +24,14 @@ class ScriptedModel:
         scripts = [
             ("list_files", {}),
             ("read_file", {"path": "app.py"}),
-            ("write_file", {"path": "app.py", "content": "VALUE = 'fixed'\n"}),
+            (
+                "edit_file",
+                {
+                    "path": "app.py",
+                    "old_text": "VALUE = 'bug'\n",
+                    "new_text": "VALUE = 'fixed'\n",
+                },
+            ),
             ("run_tests", {}),
         ]
         if self.calls <= len(scripts):
@@ -139,7 +146,17 @@ class AgentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 workspace.read_file("../outside.txt")
             with self.assertRaises(ValueError):
-                workspace.write_file(".git/config", "bad")
+                workspace.edit_file(".git/config", "", "bad")
+
+    def test_edit_file_requires_one_exact_match(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = RepoWorkspace(Path(directory))
+            workspace.edit_file("new.txt", "", "hello")
+            self.assertEqual(workspace.read_file("new.txt"), "hello")
+            self.assertIn(
+                "not found",
+                workspace.call_tool("edit_file", {"path": "new.txt", "old_text": "x", "new_text": "y"}),
+            )
 
     def test_missing_test_configuration_is_skipped(self):
         with tempfile.TemporaryDirectory() as directory:

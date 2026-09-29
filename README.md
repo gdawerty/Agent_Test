@@ -5,10 +5,10 @@ This repository contains a small issue-to-pull-request agent. It fetches one Git
 - `list_files`
 - `read_file`
 - `search_code`
-- `write_file`
+- `edit_file`
 - `run_tests`
 
-The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop.
+The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop. Existing files are changed with exact small replacements through `edit_file`, which keeps the agent's requests smaller.
 
 ## Install
 
@@ -22,7 +22,7 @@ gh auth login
 export GEMINI_API_KEY="your-gemini-key"
 ```
 
-Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
+Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most eight model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
 
 ```bash
 export LLM_PROVIDER=openai

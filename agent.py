@@ -506,6 +506,19 @@ class GeminiModel:
                     "arguments": function.arguments,
                 },
             }
+            # Gemini 3 requires this encrypted signature to be returned in
+            # the same assistant tool call on the next Chat Completions turn.
+            extra_content = getattr(raw_call, "extra_content", None)
+            if extra_content is None:
+                model_dump = getattr(raw_call, "model_dump", None)
+                if callable(model_dump):
+                    dumped_call = model_dump()
+                    if isinstance(dumped_call, dict):
+                        extra_content = dumped_call.get("extra_content")
+            if extra_content:
+                if hasattr(extra_content, "model_dump"):
+                    extra_content = extra_content.model_dump(exclude_none=True)
+                normalized_call["extra_content"] = extra_content
             normalized_tool_calls.append(normalized_call)
             function_calls.append(
                 {

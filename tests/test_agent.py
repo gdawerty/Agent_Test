@@ -2,8 +2,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
-from agent import AgentRunner, RepoWorkspace
+from agent import AgentRunner, GeminiModel, RepoWorkspace
 
 
 class FakeResponse:
@@ -44,6 +45,58 @@ class ScriptedModel:
 
 
 class AgentTests(unittest.TestCase):
+    def test_gemini_thought_signature_is_preserved(self):
+        signature = "encrypted-signature"
+        raw_call = SimpleNamespace(
+            id="call-1",
+            function=SimpleNamespace(name="list_files", arguments="{}"),
+            extra_content={"google": {"thought_signature": signature}},
+        )
+        raw_message = SimpleNamespace(content="", tool_calls=[raw_call])
+        raw_response = SimpleNamespace(
+            choices=[SimpleNamespace(message=raw_message)]
+        )
+
+        class FakeCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return raw_response
+
+        completions = FakeCompletions()
+        model = GeminiModel.__new__(GeminiModel)
+        model.model = "gemini-3.5-flash-lite"
+        model.client = SimpleNamespace(
+            chat=SimpleNamespace(completions=completions)
+        )
+
+        response = model.create(
+            instructions="instructions",
+            input_items=[{"role": "user", "content": "issue"}],
+            tools=[],
+        )
+        assistant_call = response.output[0]["tool_calls"][0]
+        self.assertEqual(
+            assistant_call["extra_content"]["google"]["thought_signature"],
+            signature,
+        )
+
+        next_messages = model._messages(
+            "instructions",
+            [
+                {"role": "user", "content": "issue"},
+                *response.output,
+                {
+                    "type": "function_call_output",
+                    "call_id": "call-1",
+                    "output": "files",
+                },
+            ],
+        )
+        self.assertEqual(
+            next_messages[2]["tool_calls"][0]["extra_content"],
+            {"google": {"thought_signature": signature}},
+        )
+
     def test_tool_loop_edits_repo_and_runs_tests(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

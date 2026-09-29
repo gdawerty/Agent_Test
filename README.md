@@ -11,6 +11,8 @@ The repository file list is supplied in the initial issue context, so the model 
 
 The agent has twelve paced model turns and receives its current turn and remaining budget on every request. If it uses its final turn to make a change, the harness still runs the final tests and prepares the pull request when they pass.
 
+The harness also limits exploration: the model gets at most two code searches, loses search access after editing, can only read or edit from turn 6 onward if it has not changed anything, and gets only `edit_file` from turn 7 onward until it makes a change. This prevents repeated searches and reads from consuming the entire run.
+
 `search_code` returns line numbers with nearby context, and `read_file` requires a focused line range capped at 200 lines. This lets the agent jump to the relevant part of a large file instead of repeatedly sending its entire contents to the model.
 
 ## Install

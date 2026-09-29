@@ -141,6 +141,66 @@ class AgentTests(unittest.TestCase):
             test_result = json.loads(RepoWorkspace(root).run_tests())
             self.assertEqual(test_result["status"], "passed")
 
+    def test_tool_budget_gates_search_and_forces_an_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+
+            class WanderingModel:
+                def __init__(self):
+                    self.calls = 0
+                    self.available_tools = []
+
+                def create(self, *, instructions, input_items, tools):
+                    self.calls += 1
+                    self.available_tools.append({tool["name"] for tool in tools})
+                    scripts = [
+                        ("search_code", {"query": "VALUE"}),
+                        ("search_code", {"query": "VALUE"}),
+                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
+                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
+                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
+                        (
+                            "edit_file",
+                            {
+                                "path": "app.py",
+                                "old_text": "VALUE = 'bug'\n",
+                                "new_text": "VALUE = 'fixed'\n",
+                            },
+                        ),
+                    ]
+                    if self.calls <= len(scripts):
+                        name, arguments = scripts[self.calls - 1]
+                        return FakeResponse(
+                            output=[
+                                {
+                                    "type": "function_call",
+                                    "name": name,
+                                    "arguments": json.dumps(arguments),
+                                    "call_id": f"call-{self.calls}",
+                                }
+                            ]
+                        )
+                    return FakeResponse(output_text="Fixed the value.")
+
+            model = WanderingModel()
+            result = AgentRunner(
+                RepoWorkspace(root), model, max_steps=7, log=lambda _: None
+            ).run({"number": 9, "title": "Fix value", "body": "Fix it."})
+
+            self.assertEqual(result.steps, 7)
+            self.assertNotIn("search_code", model.available_tools[2])
+            self.assertEqual(
+                model.available_tools[5], {"read_file", "edit_file"}
+            )
+            self.assertEqual(
+                model.available_tools[6], {"read_file", "edit_file", "run_tests"}
+            )
+            self.assertEqual(
+                (root / "app.py").read_text(encoding="utf-8"),
+                "VALUE = 'fixed'\n",
+            )
+
     def test_paths_cannot_escape_repository(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = RepoWorkspace(Path(directory))

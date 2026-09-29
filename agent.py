@@ -382,8 +382,10 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "search_code",
         "description": (
-            "Search repository text for literal text or a code symbol and return line numbers "
-            "with nearby context. Omit the result's file and line prefixes when editing."
+            "Search the CONTENTS of repository files for literal text, a symbol, a function, "
+            "a class, an error message, or behavior and return line numbers with nearby "
+            "context. Do not use this tool to search for filenames; the repository file "
+            "list is already provided. Omit the result's file and line prefixes when editing."
         ),
         "parameters": {
             "type": "object",
@@ -726,22 +728,58 @@ class AgentRunner:
                 ),
             }
         ]
+        search_calls = 0
+        edit_made = False
 
         for step in range(1, self.max_steps + 1):
             self.log(f"\n--- Agent step {step} ---")
             if step > 1 and self.request_delay:
                 time.sleep(self.request_delay)
 
+            allowed_tools = TOOLS
+            if edit_made:
+                allowed_tools = [
+                    tool
+                    for tool in TOOLS
+                    if tool["name"] in {"read_file", "edit_file", "run_tests"}
+                ]
+            elif search_calls >= 2:
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] != "search_code"
+                ]
+            if step >= 6 and not edit_made:
+                allowed_tools = [
+                    tool
+                    for tool in allowed_tools
+                    if tool["name"] in {"read_file", "edit_file"}
+                ]
+            if step >= 7 and not edit_made:
+                allowed_tools = [
+                    tool for tool in allowed_tools if tool["name"] == "edit_file"
+                ]
+            allowed_tool_names = {tool["name"] for tool in allowed_tools}
+
             remaining = self.max_steps - step + 1
             turn_instructions = (
                 f"{SYSTEM_PROMPT}\n\n"
                 f"CURRENT TURN: {step} of {self.max_steps}\n"
                 f"TURNS REMAINING INCLUDING THIS ONE: {remaining}\n"
+                f"SEARCH CALLS USED: {search_calls} of 2\n"
             )
-            if step >= 5:
+            if search_calls >= 2:
+                turn_instructions += (
+                    "You have exhausted your search budget. Do not continue exploring "
+                    "the repository; use the information already gathered.\n"
+                )
+            if step >= 6 and not edit_made:
                 turn_instructions += (
                     "You must make an edit now unless you are genuinely blocked. "
-                    "Stop exploring and reserve turns for testing and finalizing.\n"
+                    "Only read_file and edit_file are available in this phase.\n"
+                )
+            if step >= 7 and not edit_made:
+                turn_instructions += (
+                    "You have not edited any code yet. Make the smallest reasonable "
+                    "edit now; edit_file is the only available tool.\n"
                 )
             if remaining <= 3:
                 turn_instructions += (
@@ -754,7 +792,7 @@ class AgentRunner:
                     response = self.model.create(
                         instructions=turn_instructions,
                         input_items=input_items,
-                        tools=TOOLS,
+                        tools=allowed_tools,
                     )
                     break
                 except Exception as exc:
@@ -780,13 +818,25 @@ class AgentRunner:
                 raw_arguments = _item_value(call, "arguments", "{}")
                 call_id = _item_value(call, "call_id")
                 self.log(f"Tool: {name}({raw_arguments})")
-                try:
-                    arguments = json.loads(raw_arguments)
-                    if not isinstance(arguments, dict):
-                        raise ValueError("tool arguments must be a JSON object")
-                    result = self.workspace.call_tool(name, arguments)
-                except Exception as exc:
-                    result = f"TOOL ERROR: {type(exc).__name__}: {exc}"
+                if name not in allowed_tool_names:
+                    result = (
+                        f"TOOL ERROR: {name} is unavailable in the current phase; "
+                        "use one of the available tools."
+                    )
+                else:
+                    if name == "search_code":
+                        search_calls += 1
+                    try:
+                        arguments = json.loads(raw_arguments)
+                        if not isinstance(arguments, dict):
+                            raise ValueError("tool arguments must be a JSON object")
+                        result = self.workspace.call_tool(name, arguments)
+                    except Exception as exc:
+                        result = f"TOOL ERROR: {type(exc).__name__}: {exc}"
+                    if name == "edit_file" and result.startswith(
+                        ("Successfully edited", "Successfully created")
+                    ):
+                        edit_made = True
                 self.log(_truncate(result, 1_000))
                 input_items.append(
                     {

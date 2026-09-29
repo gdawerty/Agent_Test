@@ -1,0 +1,49 @@
+name: Agent fix
+
+on:
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: GitHub issue number to fix
+        required: true
+        type: string
+  issues:
+    types: [opened]
+
+permissions:
+  contents: write
+  issues: read
+  pull-requests: write
+
+concurrency:
+  group: agent-issue-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  fix:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'issues'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install agent dependency
+        run: python -m pip install -r requirements.txt
+
+      - name: Run issue agent
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LLM_PROVIDER: ${{ vars.LLM_PROVIDER || 'gemini' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5.6' }}
+          ISSUE_NUMBER: ${{ github.event.inputs.issue_number || github.event.issue.number }}
+        run: python agent.py "$ISSUE_NUMBER"

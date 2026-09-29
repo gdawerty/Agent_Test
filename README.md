@@ -1,14 +1,15 @@
 # GitHub issue agent MVP
 
-This repository contains a small issue-to-pull-request agent. It fetches one GitHub issue with `gh`, gives the issue to Gemini or OpenAI, and lets the model use five repository tools:
+This repository contains a small issue-to-pull-request agent. It fetches one GitHub issue with `gh`, gives the issue to Gemini or OpenAI, and lets the model use four repository tools:
 
-- `list_files`
 - `read_file`
 - `search_code`
 - `edit_file`
 - `run_tests`
 
-The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop. Existing files are changed with exact small replacements through `edit_file`, which keeps the agent's requests smaller.
+The repository file list is supplied in the initial issue context, so the model does not spend a turn discovering it. The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop. Existing files are changed with exact small replacements through `edit_file`, which keeps the agent's requests smaller.
+
+The agent has twelve paced model turns and receives its current turn and remaining budget on every request. If it uses its final turn to make a change, the harness still runs the final tests and prepares the pull request when they pass.
 
 `search_code` returns line numbers with nearby context, and `read_file` requires a focused line range capped at 200 lines. This lets the agent jump to the relevant part of a large file instead of repeatedly sending its entire contents to the model.
 
@@ -24,7 +25,7 @@ gh auth login
 export GEMINI_API_KEY="your-gemini-key"
 ```
 
-Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most ten model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
+Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most twelve model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
 
 ```bash
 export LLM_PROVIDER=openai

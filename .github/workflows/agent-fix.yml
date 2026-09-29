@@ -46,4 +46,4 @@ jobs:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5.6' }}
           ISSUE_NUMBER: ${{ github.event.inputs.issue_number || github.event.issue.number }}
-        run: python agent.py "$ISSUE_NUMBER" --max-steps 10
+        run: python agent.py "$ISSUE_NUMBER" --max-steps 12

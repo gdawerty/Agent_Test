@@ -28,7 +28,7 @@ DEFAULT_OPENAI_MODEL = "gpt-5.6"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
-MAX_STEPS = 10
+MAX_STEPS = 12
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
 IGNORED_DIRECTORIES = {
@@ -213,6 +213,7 @@ class RepoWorkspace:
             result = subprocess.run(
                 [
                     "rg",
+                    "-F",
                     "-n",
                     "-C",
                     "2",
@@ -360,17 +361,6 @@ class RepoWorkspace:
 TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
-        "name": "list_files",
-        "description": "List visible source and configuration files in the repository.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": [],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "type": "function",
         "name": "read_file",
         "description": (
             "Read a focused line range from a UTF-8 text file using a repository-relative path. "
@@ -392,7 +382,7 @@ TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "name": "search_code",
         "description": (
-            "Search repository text for a regex or code symbol and return line numbers "
+            "Search repository text for literal text or a code symbol and return line numbers "
             "with nearby context. Omit the result's file and line prefixes when editing."
         ),
         "parameters": {
@@ -437,35 +427,39 @@ TOOLS: list[dict[str, Any]] = [
 SYSTEM_PROMPT = """
 You are a careful software engineering agent fixing one GitHub issue.
 
-You have a limited number of tool turns, so reserve enough turns to edit, test,
-and finish:
-1. Call list_files once only if you need repository orientation.
-2. Use search_code to locate the relevant symbol or behavior. Search results include
-   line numbers and nearby context.
-3. Use read_file with start_line and end_line to inspect only the relevant section.
+You have a small number of tool turns, so work quickly and reserve enough turns to
+edit, test, and finish:
+1. Use search_code to locate the relevant symbol or behavior. Search uses literal text
+   and returns line numbers with nearby context.
+2. Use read_file with start_line and end_line to inspect only the relevant section.
    Do not reread an entire large file from the beginning. The returned lines are
    prefixed with line numbers for navigation; omit those prefixes when copying
    old_text or new_text for edit_file.
-4. Inspect the relevant tests if needed, then make one focused edit with edit_file. For an
-   existing file, copy a unique exact block into old_text and put only the replacement
-   in new_text. Use an empty old_text only to create a new file.
-   If the change affects a CLI, API, parser, or validation path, inspect its downstream
-   callers and update the relevant tests before declaring it complete.
-5. Do not run the test suite before making an edit unless the issue specifically
+3. Inspect relevant tests only if necessary, then make the smallest reasonable edit
+   with edit_file. Once you have enough information to make a reasonable fix, edit
+   instead of continuing to investigate.
+4. Do not run the test suite before making an edit unless the issue specifically
    requires reproducing an existing failure.
-6. Run the tests once after the edit. If they fail because of your change, make the
-   smallest follow-up edit and run them again.
-7. After the tests pass, immediately return your final summary. Do not use another
-   tool to reread or recheck code you already inspected.
-8. If the issue cannot be fixed, stop with a concrete explanation rather than
-   spending the remaining turns exploring unrelated code.
+5. Run the tests after editing. If they fail because of your change, make the smallest
+   follow-up edit and run them again.
+6. If tests pass and the issue is fixed, immediately return your final summary.
+7. If the issue cannot be fixed, stop with a concrete explanation rather than exploring
+   unrelated code.
+
+Execution constraints:
+- You should normally make the first edit within 4-5 model turns.
+- Do not repeatedly search for code you have already located.
+- Do not inspect unrelated initialization or entrypoint code unless required.
+- Do not search broadly for tests when the repository already contains an obvious test file.
+- Reserve at least two turns after the first edit for testing and finalizing.
+- When changing a CLI, API, parser, or validation path, inspect downstream callers and
+  update relevant tests before declaring the change complete.
 
 Rules:
 - Treat the issue as a bug report, not as permission to make unrelated refactors.
 - Use only the supplied repository tools.
 - Do not create commits, branches, or pull requests; the harness does that.
 - Never try to access files outside the repository.
-- Avoid repeated searches and repeated reads of the same content.
 - Do not claim tests passed unless run_tests reported that they passed.
 - In your final response, summarize the change, tests, and any remaining limitation.
 """.strip()
@@ -675,10 +669,24 @@ class AgentRunner:
         self.request_delay = max(0.0, request_delay)
         self.log = log
 
+    def _has_worktree_changes(self) -> bool:
+        try:
+            result = subprocess.run(
+                ["git", "status", "--porcelain", "--untracked-files=all"],
+                cwd=self.workspace.root,
+                text=True,
+                capture_output=True,
+                timeout=30,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0 and bool(result.stdout.strip())
+
     def run(self, issue: dict[str, Any]) -> AgentResult:
         issue_number = issue["number"]
         title = issue.get("title", "")
         body = issue.get("body") or "(no issue description)"
+        repository_files = _truncate(self.workspace.list_files(), MAX_TOOL_OUTPUT)
         input_items: list[Any] = [
             {
                 "role": "user",
@@ -686,6 +694,7 @@ class AgentRunner:
                     f"GitHub issue #{issue_number}\n"
                     f"Title: {title}\n\n"
                     f"Description:\n{body}\n\n"
+                    f"Repository files:\n{repository_files}\n\n"
                     "Fix this issue in the current repository."
                 ),
             }
@@ -696,10 +705,27 @@ class AgentRunner:
             if step > 1 and self.request_delay:
                 time.sleep(self.request_delay)
 
+            remaining = self.max_steps - step + 1
+            turn_instructions = (
+                f"{SYSTEM_PROMPT}\n\n"
+                f"CURRENT TURN: {step} of {self.max_steps}\n"
+                f"TURNS REMAINING INCLUDING THIS ONE: {remaining}\n"
+            )
+            if step >= 5:
+                turn_instructions += (
+                    "You must make an edit now unless you are genuinely blocked. "
+                    "Stop exploring and reserve turns for testing and finalizing.\n"
+                )
+            if remaining <= 3:
+                turn_instructions += (
+                    "Stop exploring. Edit, test, and finalize now; do not make another "
+                    "unnecessary search or read.\n"
+                )
+
             for attempt in range(2):
                 try:
                     response = self.model.create(
-                        instructions=SYSTEM_PROMPT,
+                        instructions=turn_instructions,
                         input_items=input_items,
                         tools=TOOLS,
                     )
@@ -743,7 +769,16 @@ class AgentRunner:
                     }
                 )
 
-        raise AgentError(f"Agent exceeded the maximum of {self.max_steps} steps")
+        if self._has_worktree_changes():
+            message = (
+                f"Agent reached the maximum of {self.max_steps} steps after making "
+                "a change. The harness will run the final tests and prepare the "
+                "pull request if they pass."
+            )
+            self.log(message)
+            return AgentResult(message, self.max_steps)
+
+        raise AgentError(f"Agent exceeded the maximum of {self.max_steps} steps without making a change")
 
 
 def repository_root(start: Path) -> Path:

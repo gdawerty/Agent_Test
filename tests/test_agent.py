@@ -1,4 +1,5 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,8 +23,8 @@ class ScriptedModel:
     def create(self, *, instructions, input_items, tools):
         self.calls += 1
         scripts = [
-            ("list_files", {}),
-            ("read_file", {"path": "app.py"}),
+            ("search_code", {"query": "VALUE"}),
+            ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
             (
                 "edit_file",
                 {
@@ -173,6 +174,42 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = json.loads(RepoWorkspace(Path(directory)).run_tests())
             self.assertEqual(result["status"], "skipped")
+
+    def test_changed_worktree_survives_turn_limit_for_final_checks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+
+            class EditOnlyModel:
+                def create(self, *, instructions, input_items, tools):
+                    return FakeResponse(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": "edit_file",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "app.py",
+                                        "old_text": "VALUE = 'bug'\n",
+                                        "new_text": "VALUE = 'fixed'\n",
+                                    }
+                                ),
+                                "call_id": "edit-1",
+                            }
+                        ]
+                    )
+
+            result = AgentRunner(
+                RepoWorkspace(root), EditOnlyModel(), max_steps=1, log=lambda _: None
+            ).run({"number": 8, "title": "Fix value", "body": "Fix it."})
+
+            self.assertEqual(result.steps, 1)
+            self.assertIn("final tests", result.final_message)
+            self.assertEqual(
+                (root / "app.py").read_text(encoding="utf-8"),
+                "VALUE = 'fixed'\n",
+            )
 
 
 if __name__ == "__main__":

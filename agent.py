@@ -29,6 +29,7 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 8
+MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
 IGNORED_DIRECTORIES = {
     ".git",
@@ -141,18 +142,41 @@ class RepoWorkspace:
             result += f"\n...[{len(files) - 1000} more files omitted]"
         return result or "(repository has no visible files)"
 
-    def read_file(self, path: str) -> str:
+    def read_file(
+        self,
+        path: str,
+        start_line: int = 1,
+        end_line: int | None = None,
+    ) -> str:
         target = self._safe_path(path)
         if not target.exists():
             return f"ERROR: {path} does not exist"
         if not target.is_file():
             return f"ERROR: {path} is not a file"
+        if start_line < 1:
+            return "ERROR: start_line must be at least 1"
+        if end_line is not None and end_line < start_line:
+            return "ERROR: end_line must be greater than or equal to start_line"
 
         try:
-            content = target.read_text(encoding="utf-8")
+            lines = target.read_text(encoding="utf-8").splitlines()
         except UnicodeDecodeError:
             return f"ERROR: {path} is not a UTF-8 text file"
-        return _truncate(content, MAX_FILE_OUTPUT)
+
+        start = start_line - 1
+        requested_end = end_line if end_line is not None else start_line + MAX_READ_LINES - 1
+        end = min(requested_end, start_line + MAX_READ_LINES - 1, len(lines))
+        if start >= len(lines):
+            return f"ERROR: start_line {start_line} is past the end of {path}"
+
+        selected = [
+            f"{line_number}: {lines[line_number - 1]}"
+            for line_number in range(start_line, end + 1)
+        ]
+        result = "\n".join(selected)
+        if end < requested_end and end < len(lines):
+            result += f"\n...[read limited to {MAX_READ_LINES} lines]"
+        return _truncate(result, MAX_FILE_OUTPUT)
 
     def edit_file(self, path: str, old_text: str, new_text: str) -> str:
         target = self._safe_path(path)
@@ -190,6 +214,8 @@ class RepoWorkspace:
                 [
                     "rg",
                     "-n",
+                    "-C",
+                    "2",
                     "--hidden",
                     "--glob",
                     "!.git/**",
@@ -223,9 +249,19 @@ class RepoWorkspace:
                 lines = path.read_text(encoding="utf-8").splitlines()
             except (UnicodeDecodeError, OSError):
                 continue
-            for line_number, line in enumerate(lines, start=1):
-                if query in line:
-                    matches.append(f"{relative}:{line_number}:{line}")
+            matching_lines = {
+                line_number
+                for line_number, line in enumerate(lines, start=1)
+                if query in line
+            }
+            context_lines = {
+                line_number
+                for match in matching_lines
+                for line_number in range(max(1, match - 2), min(len(lines), match + 2) + 1)
+            }
+            for line_number in sorted(context_lines):
+                marker = ":" if line_number in matching_lines else "-"
+                matches.append(f"{relative}{marker}{line_number}{marker}{lines[line_number - 1]}")
         return _truncate("\n".join(matches) or "(no matches)")
 
     def _test_command(self) -> list[str] | None:
@@ -336,18 +372,29 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "name": "read_file",
-        "description": "Read a UTF-8 text file using a repository-relative path.",
+        "description": (
+            "Read a focused line range from a UTF-8 text file using a repository-relative path. "
+            "Use search_code first, then read only the relevant lines. Output is line-numbered "
+            "for navigation; omit the numeric prefixes when using text in edit_file."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {"path": {"type": "string"}},
-            "required": ["path"],
+            "properties": {
+                "path": {"type": "string"},
+                "start_line": {"type": "integer", "minimum": 1},
+                "end_line": {"type": "integer", "minimum": 1},
+            },
+            "required": ["path", "start_line", "end_line"],
             "additionalProperties": False,
         },
     },
     {
         "type": "function",
         "name": "search_code",
-        "description": "Search repository text for a regex or code symbol.",
+        "description": (
+            "Search repository text for a regex or code symbol and return line numbers "
+            "with nearby context. Omit the result's file and line prefixes when editing."
+        ),
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -390,22 +437,28 @@ TOOLS: list[dict[str, Any]] = [
 SYSTEM_PROMPT = """
 You are a careful software engineering agent fixing one GitHub issue.
 
-Work methodically:
-1. Inspect the repository and identify the relevant code.
-2. Search for symbols or behavior named by the issue.
-3. Read the smallest set of relevant files.
-4. Make the smallest reasonable fix with edit_file. For an existing file,
-   copy a unique exact block into old_text and put only the replacement in
-   new_text. Use an empty old_text only to create a new file.
-5. Run the tests. If they fail because of your change, investigate and fix them.
-6. Stop using tools only when the issue is fixed or you have a concrete explanation
-   of why it cannot be fixed.
+Use the limited tool turns efficiently:
+1. Call list_files once only if you need repository orientation.
+2. Use search_code to locate the relevant symbol or behavior. Search results include
+   line numbers and nearby context.
+3. Use read_file with start_line and end_line to inspect only the relevant section.
+   Do not reread an entire large file from the beginning. The returned lines are
+   prefixed with line numbers for navigation; omit those prefixes when copying
+   old_text or new_text for edit_file.
+4. Inspect the relevant tests, then make one focused edit with edit_file. For an
+   existing file, copy a unique exact block into old_text and put only the replacement
+   in new_text. Use an empty old_text only to create a new file.
+5. Run the tests once after the edit. If they fail because of your change, make the
+   smallest follow-up edit and run them again.
+6. Stop as soon as the issue is fixed and the tests pass, or give a concrete reason
+   why it cannot be fixed.
 
 Rules:
 - Treat the issue as a bug report, not as permission to make unrelated refactors.
 - Use only the supplied repository tools.
 - Do not create commits, branches, or pull requests; the harness does that.
 - Never try to access files outside the repository.
+- Avoid repeated searches and repeated reads of the same content.
 - Do not claim tests passed unless run_tests reported that they passed.
 - In your final response, summarize the change, tests, and any remaining limitation.
 """.strip()

@@ -10,6 +10,8 @@ This repository contains a small issue-to-pull-request agent. It fetches one Git
 
 The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop. Existing files are changed with exact small replacements through `edit_file`, which keeps the agent's requests smaller.
 
+`search_code` returns line numbers with nearby context, and `read_file` requires a focused line range capped at 200 lines. This lets the agent jump to the relevant part of a large file instead of repeatedly sending its entire contents to the model.
+
 ## Install
 
 Run this from a clone of the repository you want the agent to modify:

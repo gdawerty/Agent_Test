@@ -148,11 +148,22 @@ class AgentTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 workspace.edit_file(".git/config", "", "bad")
 
+    def test_read_file_can_target_a_line_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = RepoWorkspace(Path(directory))
+            Path(directory, "sample.py").write_text(
+                "one\ntwo\nthree\nfour\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                workspace.read_file("sample.py", start_line=2, end_line=3),
+                "2: two\n3: three",
+            )
+
     def test_edit_file_requires_one_exact_match(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = RepoWorkspace(Path(directory))
             workspace.edit_file("new.txt", "", "hello")
-            self.assertEqual(workspace.read_file("new.txt"), "hello")
+            self.assertEqual(workspace.read_file("new.txt"), "1: hello")
             self.assertIn(
                 "not found",
                 workspace.call_tool("edit_file", {"path": "new.txt", "old_text": "x", "new_text": "y"}),

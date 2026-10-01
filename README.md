@@ -1,5 +1,7 @@
 # GitHub issue agent MVP
 
+[![CI](https://github.com/gdawerty/Agent_Test/actions/workflows/ci.yml/badge.svg)](https://github.com/gdawerty/Agent_Test/actions/workflows/ci.yml)
+
 This repository contains a small issue-to-pull-request agent. It fetches one GitHub issue with `gh`, gives the issue to Gemini or OpenAI, and lets the model use four repository tools:
 
 - `read_file`

@@ -15,6 +15,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,13 +32,36 @@ MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 12
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
-SENSITIVE_TEST_ENV_MARKERS = (
-    "API_KEY",
-    "TOKEN",
-    "SECRET",
-    "PASSWORD",
-    "PRIVATE_KEY",
-    "CREDENTIAL",
+TEST_ENV_ALLOWLIST = {
+    "CI",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "PATH",
+    "TEMP",
+    "TMP",
+    "TMPDIR",
+}
+PROTECTED_PATH_PREFIXES = (
+    ".github/workflows/",
+    ".github/actions/",
+)
+PROTECTED_FILE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.staging",
+    "credentials",
+    "credentials.json",
+    "service-account.json",
+    "id_rsa",
+    "id_ed25519",
+}
+PROTECTED_FILE_SUFFIXES = (
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
 )
 IGNORED_DIRECTORIES = {
     ".git",
@@ -115,12 +139,37 @@ def _run_process(
 
 
 def _test_environment() -> dict[str, str]:
-    """Run repository tests without exposing workflow credentials."""
+    """Run repository tests with a minimal environment and no credentials."""
     return {
-        name: value
-        for name, value in os.environ.items()
-        if not any(marker in name.upper() for marker in SENSITIVE_TEST_ENV_MARKERS)
+        name: os.environ[name]
+        for name in TEST_ENV_ALLOWLIST
+        if name in os.environ
     }
+
+
+def _is_protected_path(relative: Path) -> bool:
+    """Return whether an agent edit could affect workflow execution or secrets."""
+    normalized = relative.as_posix()
+    filename = relative.name.lower()
+    return (
+        any(
+            normalized == prefix.rstrip("/") or normalized.startswith(prefix)
+            for prefix in PROTECTED_PATH_PREFIXES
+        )
+        or filename in PROTECTED_FILE_NAMES
+        or filename.startswith(".env.")
+        or filename.endswith(PROTECTED_FILE_SUFFIXES)
+    )
+
+
+def _is_secret_path(relative: Path) -> bool:
+    """Return whether a path looks like a credential or private key file."""
+    filename = relative.name.lower()
+    return (
+        filename in PROTECTED_FILE_NAMES
+        or filename.startswith(".env")
+        or filename.endswith(PROTECTED_FILE_SUFFIXES)
+    )
 
 
 class RepoWorkspace:
@@ -151,6 +200,8 @@ class RepoWorkspace:
             relative = path.relative_to(self.root)
             if any(part in IGNORED_DIRECTORIES for part in relative.parts):
                 continue
+            if _is_secret_path(relative):
+                continue
             files.append(relative.as_posix())
 
         files.sort()
@@ -166,6 +217,9 @@ class RepoWorkspace:
         end_line: int | None = None,
     ) -> str:
         target = self._safe_path(path)
+        relative = target.relative_to(self.root)
+        if _is_secret_path(relative):
+            return f"ERROR: access to credential file {path} is blocked"
         if not target.exists():
             return f"ERROR: {path} does not exist"
         if not target.is_file():
@@ -197,6 +251,11 @@ class RepoWorkspace:
 
     def edit_file(self, path: str, old_text: str, new_text: str) -> str:
         target = self._safe_path(path)
+        relative = target.relative_to(self.root)
+        if _is_protected_path(relative):
+            raise ValueError(
+                "Editing workflow, action, credential, or private-key files is blocked"
+            )
         if len(new_text) > 1_000_000:
             raise ValueError("Refusing to write more than 1 MB")
 
@@ -237,6 +296,20 @@ class RepoWorkspace:
                     "--hidden",
                     "--glob",
                     "!.git/**",
+                    "--glob",
+                    "!.env*",
+                    "--glob",
+                    "!**/.env*",
+                    "--glob",
+                    "!**/credentials*",
+                    "--glob",
+                    "!**/*.pem",
+                    "--glob",
+                    "!**/*.key",
+                    "--glob",
+                    "!**/*.p12",
+                    "--glob",
+                    "!**/*.pfx",
                     "--",
                     query,
                     ".",
@@ -262,6 +335,8 @@ class RepoWorkspace:
                 continue
             relative = path.relative_to(self.root)
             if any(part in IGNORED_DIRECTORIES for part in relative.parts):
+                continue
+            if _is_secret_path(relative):
                 continue
             try:
                 lines = path.read_text(encoding="utf-8").splitlines()
@@ -323,41 +398,56 @@ class RepoWorkspace:
                 }
             )
 
-        try:
-            result = subprocess.run(
-                command,
-                cwd=self.root,
-                text=True,
-                capture_output=True,
-                timeout=120,
-                env=_test_environment(),
-            )
-            output = _truncate((result.stdout or "") + (result.stderr or ""))
-            return json.dumps(
+        test_environment = _test_environment()
+        with tempfile.TemporaryDirectory(prefix="agent-test-home-") as test_home:
+            test_environment.update(
                 {
-                    "status": "passed" if result.returncode == 0 else "failed",
-                    "exit_code": result.returncode,
-                    "command": command,
-                    "output": output,
+                    "HOME": test_home,
+                    "USERPROFILE": test_home,
+                    "XDG_CONFIG_HOME": os.path.join(test_home, ".config"),
+                    "PYTHONNOUSERSITE": "1",
+                    "GIT_CONFIG_NOSYSTEM": "1",
+                    "GIT_CONFIG_GLOBAL": os.devnull,
+                    "GIT_TERMINAL_PROMPT": "0",
+                    "NO_PROXY": "*",
+                    "no_proxy": "*",
                 }
             )
-        except FileNotFoundError as exc:
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "command": command,
-                    "output": f"Command not found: {exc.filename}",
-                }
-            )
-        except subprocess.TimeoutExpired as exc:
-            output = (exc.stdout or "") + (exc.stderr or "")
-            return json.dumps(
-                {
-                    "status": "failed",
-                    "command": command,
-                    "output": f"Timed out after 120 seconds\n{_truncate(output)}",
-                }
-            )
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=self.root,
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                    env=test_environment,
+                )
+            except FileNotFoundError as exc:
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "command": command,
+                        "output": f"Command not found: {exc.filename}",
+                    }
+                )
+            except subprocess.TimeoutExpired as exc:
+                output = (exc.stdout or "") + (exc.stderr or "")
+                return json.dumps(
+                    {
+                        "status": "failed",
+                        "command": command,
+                        "output": f"Timed out after 120 seconds\n{_truncate(output)}",
+                    }
+                )
+        output = _truncate((result.stdout or "") + (result.stderr or ""))
+        return json.dumps(
+            {
+                "status": "passed" if result.returncode == 0 else "failed",
+                "exit_code": result.returncode,
+                "command": command,
+                "output": output,
+            }
+        )
 
     def call_tool(self, name: str, arguments: dict[str, Any]) -> str:
         handlers: dict[str, Callable[..., str]] = {
@@ -897,6 +987,29 @@ def require_clean_worktree(root: Path) -> None:
         )
 
 
+def _changed_paths(root: Path) -> set[str]:
+    paths: set[str] = set()
+    for command in (
+        ["git", "diff", "--name-only"],
+        ["git", "diff", "--cached", "--name-only"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ):
+        output = _run_process(command, cwd=root, check=False)
+        paths.update(line.strip() for line in output.splitlines() if line.strip())
+    return paths
+
+
+def validate_agent_changes(root: Path) -> None:
+    protected = sorted(
+        path for path in _changed_paths(root) if _is_protected_path(Path(path))
+    )
+    if protected:
+        raise AgentError(
+            "The agent changed protected workflow or credential paths; "
+            "no pull request will be created:\n" + "\n".join(protected)
+        )
+
+
 def get_issue(root: Path, issue_number: int) -> dict[str, Any]:
     raw = _run_process(
         [
@@ -918,13 +1031,56 @@ def get_issue(root: Path, issue_number: int) -> dict[str, Any]:
     return issue
 
 
+def find_open_issue_pr(root: Path, issue_number: int) -> str | None:
+    raw = _run_process(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--state",
+            "open",
+            "--limit",
+            "100",
+            "--json",
+            "number,title,body,url",
+        ],
+        cwd=root,
+    )
+    try:
+        pull_requests = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise AgentError(f"gh returned invalid pull request JSON: {exc}") from exc
+
+    marker = re.compile(rf"^\s*Fixes\s+#{re.escape(str(issue_number))}\b", re.IGNORECASE | re.MULTILINE)
+    title_marker = re.compile(rf"^Fix\s+#{re.escape(str(issue_number))}:\s*", re.IGNORECASE)
+    for pull_request in pull_requests:
+        title = str(pull_request.get("title") or "")
+        body = str(pull_request.get("body") or "")
+        if marker.search(body) or title_marker.search(title):
+            return str(pull_request.get("url") or pull_request.get("number"))
+    return None
+
+
+def _remote_branch_exists(root: Path, branch: str) -> bool:
+    output = _run_process(
+        ["git", "ls-remote", "--heads", "origin", f"refs/heads/{branch}"],
+        cwd=root,
+        check=False,
+    )
+    return any(line.rstrip().endswith(f"refs/heads/{branch}") for line in output.splitlines())
+
+
 def create_branch(root: Path, issue_number: int) -> str:
-    branch = f"agent/issue-{issue_number}"
+    base_branch = f"agent/issue-{issue_number}"
+    branch = base_branch
     existing = _run_process(["git", "branch", "--list", branch], cwd=root).strip()
-    if existing:
-        raise AgentError(
-            f"Branch {branch} already exists locally. Delete or rename it before retrying."
-        )
+    if existing or _remote_branch_exists(root, branch):
+        suffix = os.environ.get("GITHUB_RUN_ID") or str(time.time_ns())
+        branch = f"{base_branch}-retry-{suffix}"
+        if _run_process(["git", "branch", "--list", branch], cwd=root).strip() or _remote_branch_exists(root, branch):
+            raise AgentError(
+                f"A retry branch already exists for issue #{issue_number}: {branch}"
+            )
     _run_process(["git", "switch", "--create", branch], cwd=root)
     return branch
 
@@ -935,15 +1091,17 @@ def final_test_status(workspace: RepoWorkspace) -> dict[str, Any]:
         result = json.loads(raw)
     except json.JSONDecodeError:
         return {"status": "failed", "output": raw}
-    if result.get("status") == "failed":
+    if result.get("status") != "passed":
         raise AgentError(
-            "The final test run failed; no commit or pull request was created.\n"
+            "The final test run did not pass; no commit or pull request was created.\n"
             + str(result.get("output", ""))
+            + str(result.get("reason", ""))
         )
     return result
 
 
 def create_pr(root: Path, issue: dict[str, Any], branch: str, summary: str) -> str:
+    validate_agent_changes(root)
     _run_process(["git", "add", "--all"], cwd=root)
     staged = _run_process(["git", "diff", "--cached", "--stat"], cwd=root).strip()
     if not staged:
@@ -1040,6 +1198,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     issue = get_issue(root, args.issue_number)
     print(f"Working on #{issue['number']}: {issue['title']}")
 
+    existing_pr = find_open_issue_pr(root, args.issue_number)
+    if existing_pr:
+        print(f"An open pull request already exists for this issue: {existing_pr}")
+        return 0
+
     branch = "(dry run)"
     if not args.dry_run:
         branch = create_branch(root, args.issue_number)
@@ -1060,6 +1223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("\nAgent finished:")
     print(result.final_message)
+    validate_agent_changes(root)
     test_result = final_test_status(workspace)
     print(f"\nFinal tests: {json.dumps(test_result)}")
 

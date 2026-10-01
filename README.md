@@ -79,4 +79,8 @@ The included workflow supports two triggers:
 
 Before enabling the workflow, add an Actions repository secret named `GEMINI_API_KEY`. Optionally add `GEMINI_MODEL` as a repository variable. Set `LLM_PROVIDER` to `openai` and add `OPENAI_API_KEY` instead if you want to use OpenAI. The workflow grants the job permission to push branches and create pull requests, and uses the built-in `GH_TOKEN` for GitHub CLI authentication.
 
-Only issues labeled `agent-approved` start an automatic run. Review the generated PR and keep normal branch protection and CI checks enabled.
+Only issues labeled `agent-approved` start an automatic run. The job also uses the `agent-fix` environment. Configure that environment in **Settings → Environments** with yourself or another trusted maintainer as a required reviewer; this adds a second approval gate before the runner receives the workflow credentials.
+
+Protect the `main` branch in **Settings → Rules → Rulesets** or **Settings → Branches**. Require pull requests, at least one approving review, the `CI / test` status check, and no direct pushes or force pushes. Keep automatic merging disabled for agent-created pull requests until a maintainer reviews the diff.
+
+The harness refuses agent edits to workflow, action, credential, and private-key paths. It runs tests with a minimal environment and refuses to create a pull request when tests are skipped. If an issue already has an open automated pull request, a rerun reports that pull request instead of creating a duplicate; a stale branch receives a retry suffix.

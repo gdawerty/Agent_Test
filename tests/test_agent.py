@@ -9,7 +9,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from agent import AgentRunner, GeminiModel, RepoWorkspace
+from agent import (
+    AgentError,
+    AgentRunner,
+    GeminiModel,
+    RepoWorkspace,
+    find_open_issue_pr,
+    final_test_status,
+)
 
 
 class FakeResponse:
@@ -221,6 +228,10 @@ class AgentTests(unittest.TestCase):
                 workspace.read_file("../outside.txt")
             with self.assertRaises(ValueError):
                 workspace.edit_file(".git/config", "", "bad")
+            with self.assertRaises(ValueError):
+                workspace.edit_file(".github/workflows/agent.yml", "", "bad")
+            with self.assertRaises(ValueError):
+                workspace.edit_file(".env", "", "SECRET=bad")
 
     def test_read_file_can_target_a_line_range(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -247,6 +258,28 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = json.loads(RepoWorkspace(Path(directory)).run_tests())
             self.assertEqual(result["status"], "skipped")
+
+    def test_skipped_final_tests_block_pull_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(AgentError):
+                final_test_status(RepoWorkspace(Path(directory)))
+
+    @patch("agent._run_process")
+    def test_existing_issue_pull_request_is_detected(self, run_process):
+        run_process.return_value = json.dumps(
+            [
+                {
+                    "number": 12,
+                    "title": "Fix #7: Example",
+                    "body": "Automated fix\n\nFixes #7",
+                    "url": "https://github.com/example/repo/pull/12",
+                }
+            ]
+        )
+        self.assertEqual(
+            find_open_issue_pr(Path("."), 7),
+            "https://github.com/example/repo/pull/12",
+        )
 
     def test_run_tests_does_not_inherit_credentials(self):
         with tempfile.TemporaryDirectory() as directory:

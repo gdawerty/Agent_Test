@@ -75,8 +75,8 @@ export TEST_COMMAND='python -m pytest -q'
 The included workflow supports two triggers:
 
 1. Run **Actions → Agent fix → Run workflow** and enter an issue number.
-2. Open a new issue. The agent starts automatically and uses that issue number.
+2. Create an issue, review it, and add the `agent-approved` label. The agent then starts automatically for that issue.
 
 Before enabling the workflow, add an Actions repository secret named `GEMINI_API_KEY`. Optionally add `GEMINI_MODEL` as a repository variable. Set `LLM_PROVIDER` to `openai` and add `OPENAI_API_KEY` instead if you want to use OpenAI. The workflow grants the job permission to push branches and create pull requests, and uses the built-in `GH_TOKEN` for GitHub CLI authentication.
 
-Every newly opened issue starts a run, so configure repository access and issue permissions accordingly. Review the generated PR and keep normal branch protection and CI checks enabled.
+Only issues labeled `agent-approved` start an automatic run. Review the generated PR and keep normal branch protection and CI checks enabled.

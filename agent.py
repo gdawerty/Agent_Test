@@ -31,6 +31,14 @@ MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 12
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
+SENSITIVE_TEST_ENV_MARKERS = (
+    "API_KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PRIVATE_KEY",
+    "CREDENTIAL",
+)
 IGNORED_DIRECTORIES = {
     ".git",
     ".venv",
@@ -104,6 +112,15 @@ def _run_process(
             f"{_truncate(output)}"
         )
     return output
+
+
+def _test_environment() -> dict[str, str]:
+    """Run repository tests without exposing workflow credentials."""
+    return {
+        name: value
+        for name, value in os.environ.items()
+        if not any(marker in name.upper() for marker in SENSITIVE_TEST_ENV_MARKERS)
+    }
 
 
 class RepoWorkspace:
@@ -313,6 +330,7 @@ class RepoWorkspace:
                 text=True,
                 capture_output=True,
                 timeout=120,
+                env=_test_environment(),
             )
             output = _truncate((result.stdout or "") + (result.stderr or ""))
             return json.dumps(

@@ -1,9 +1,13 @@
 import json
+import os
+import shlex
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from agent import AgentRunner, GeminiModel, RepoWorkspace
 
@@ -243,6 +247,28 @@ class AgentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             result = json.loads(RepoWorkspace(Path(directory)).run_tests())
             self.assertEqual(result["status"], "skipped")
+
+    def test_run_tests_does_not_inherit_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script = root / "check_environment.py"
+            script.write_text(
+                "import os\n"
+                "names = ('GEMINI_API_KEY', 'OPENAI_API_KEY', 'GH_TOKEN', 'GITHUB_TOKEN')\n"
+                "assert not any(os.environ.get(name) for name in names)\n",
+                encoding="utf-8",
+            )
+            environment = {
+                "TEST_COMMAND": f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}",
+                "GEMINI_API_KEY": "test-gemini-secret",
+                "OPENAI_API_KEY": "test-openai-secret",
+                "GH_TOKEN": "test-github-token",
+                "GITHUB_TOKEN": "test-github-token",
+            }
+            with patch.dict(os.environ, environment, clear=False):
+                result = json.loads(RepoWorkspace(root).run_tests())
+
+            self.assertEqual(result["status"], "passed")
 
     def test_changed_worktree_survives_turn_limit_for_final_checks(self):
         with tempfile.TemporaryDirectory() as directory:

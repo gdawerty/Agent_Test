@@ -86,3 +86,25 @@ Only issues labeled `agent-approved` start an automatic run. The job also uses t
 Protect the `main` branch in **Settings → Rules → Rulesets** or **Settings → Branches**. Require pull requests, at least one approving review, the `CI / test` status check, and no direct pushes or force pushes. Keep automatic merging disabled for agent-created pull requests until a maintainer reviews the diff.
 
 The harness refuses agent edits to workflow, action, credential, and private-key paths. It runs tests with a minimal environment and refuses to create a pull request when tests are skipped. If an issue already has an open automated pull request, a rerun reports that pull request instead of creating a duplicate; a stale branch receives a retry suffix.
+
+## Optional mini-SWE-agent engine
+
+The default engine remains the small custom tool loop above. This repository also includes an experimental mini-SWE-agent engine for comparison. It uses mini-SWE-agent's single bash tool, LiteLLM's Gemini adapter, and a Docker execution environment, while this outer harness continues to own branch creation, protected-path validation, final tests, commits, pushes, and pull requests.
+
+The optional dependency is deliberately separate from `requirements.txt`:
+
+```bash
+python -m pip install -r requirements-mini.txt
+docker build -f Dockerfile.agent -t agent-fix-sandbox:latest .
+```
+
+Run it locally from a clean checkout with a real issue number:
+
+```bash
+export GEMINI_API_KEY="your-gemini-key"
+python agent.py 12 --engine mini --max-steps 12 --dry-run
+```
+
+The Docker container has no network, receives no `GH_TOKEN`, `GITHUB_TOKEN`, `GEMINI_API_KEY`, or `OPENAI_API_KEY`, and mounts a temporary copy at `/workspace`. The copy excludes `.git`, ignored virtualenv/build directories, and credential-looking files; safe changes are synchronized back after the run. The outer process still rejects protected-file changes and requires a passing final test run before creating a PR. This is an experimental containment boundary, not a complete security sandbox.
+
+To try it through GitHub Actions after the local dry run works, add a repository variable named `AGENT_ENGINE` with the value `mini`. The existing `agent-approved` label and environment reviewer gates still apply. Delete the variable or set it to `custom` to return to the current engine.

@@ -11,7 +11,7 @@ This repository contains a small issue-to-pull-request agent. It fetches one Git
 
 The repository file list is supplied in the initial issue context, so the model does not spend a turn discovering it. The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop. Existing files are changed with exact small replacements through `edit_file`, which keeps the agent's requests smaller.
 
-The agent has twelve paced model turns and receives its current turn and remaining budget on every request. If it uses its final turn to make a change, the harness still runs the final tests and prepares the pull request when they pass.
+The agent has fifteen paced model turns and receives its current turn and remaining budget on every request. If it uses its final turn to make a change, the harness still runs the final tests and prepares the pull request when they pass.
 
 The harness also limits exploration: the model gets at most two code searches, loses search access after editing, can only read or edit from turn 6 onward if it has not changed anything, and gets only `edit_file` from turn 7 onward until it makes a change. This prevents repeated searches and reads from consuming the entire run.
 
@@ -29,7 +29,7 @@ gh auth login
 export GEMINI_API_KEY="your-gemini-key"
 ```
 
-Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most twelve model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
+Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most fifteen model turns and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
 
 ```bash
 export LLM_PROVIDER=openai
@@ -102,7 +102,7 @@ Run it locally from a clean checkout with a real issue number:
 
 ```bash
 export GEMINI_API_KEY="your-gemini-key"
-python agent.py 12 --engine mini --max-steps 12 --dry-run
+python agent.py 12 --engine mini --max-steps 15 --dry-run
 ```
 
 The Docker container has no network, receives no `GH_TOKEN`, `GITHUB_TOKEN`, `GEMINI_API_KEY`, or `OPENAI_API_KEY`, and mounts a temporary copy at `/workspace`. The copy excludes `.git`, ignored virtualenv/build directories, and credential-looking files; safe changes are synchronized back after the run. The outer process still rejects protected-file changes and requires a passing final test run before creating a PR. This is an experimental containment boundary, not a complete security sandbox.

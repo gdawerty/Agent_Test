@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -14,8 +15,12 @@ from agent import (
     AgentRunner,
     GeminiModel,
     RepoWorkspace,
+    _prepare_mini_sandbox,
+    _sync_mini_sandbox,
     find_open_issue_pr,
     final_test_status,
+    mini_docker_run_args,
+    mini_model_name,
 )
 
 
@@ -67,11 +72,47 @@ class AgentTests(unittest.TestCase):
     def test_verbose_flag(self):
         from agent import build_parser
         parser = build_parser()
-        args = parser.parse_args(["12", "--verbose", "--provider", "gemini", "--model", "gemini-model", "--max-steps", "15"])
+        args = parser.parse_args(["12", "--verbose", "--provider", "gemini", "--model", "gemini-model", "--max-steps", "15", "--engine", "mini"])
         self.assertTrue(args.verbose)
         self.assertEqual(args.provider, "gemini")
         self.assertEqual(args.model, "gemini-model")
         self.assertEqual(args.max_steps, 15)
+        self.assertEqual(args.engine, "mini")
+
+    def test_mini_engine_uses_explicit_provider_and_isolates_container(self):
+        self.assertEqual(
+            mini_model_name("gemini", "gemini-3.5-flash-lite"),
+            "gemini/gemini-3.5-flash-lite",
+        )
+        self.assertEqual(mini_model_name("openai", "openai/gpt-5"), "openai/gpt-5")
+        repository = Path("/tmp/example-repository").resolve()
+        docker_args = mini_docker_run_args(repository)
+        self.assertIn("none", docker_args)
+        self.assertIn("--cap-drop=ALL", docker_args)
+        self.assertIn(f"{repository}:/workspace:rw", docker_args)
+        self.assertNotIn("GEMINI_API_KEY", docker_args)
+        self.assertNotIn("GH_TOKEN", docker_args)
+
+    def test_mini_sandbox_excludes_credentials_and_syncs_safe_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            (root / ".env").write_text("TEST_ONLY=placeholder\n", encoding="utf-8")
+            sandbox_directory, sandbox_root, before = _prepare_mini_sandbox(root)
+            try:
+                self.assertFalse((sandbox_root / ".env").exists())
+                (sandbox_root / "app.py").write_text("VALUE = 'fixed'\n", encoding="utf-8")
+                _sync_mini_sandbox(root, sandbox_root, before)
+            finally:
+                shutil.rmtree(sandbox_directory, ignore_errors=True)
+            self.assertEqual(
+                (root / "app.py").read_text(encoding="utf-8"),
+                "VALUE = 'fixed'\n",
+            )
+            self.assertEqual(
+                (root / ".env").read_text(encoding="utf-8"),
+                "TEST_ONLY=placeholder\n",
+            )
 
     def test_gemini_thought_signature_is_preserved(self):
         signature = "encrypted-signature"

@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -26,12 +27,15 @@ from typing import Any, Callable, Protocol, Sequence
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_MODEL = "gpt-5.6"
+DEFAULT_ENGINE = "custom"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 12
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
+MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
+MINI_DEFAULT_COST_LIMIT = 3.0
 TEST_ENV_ALLOWLIST = {
     "CI",
     "HOME",
@@ -73,6 +77,14 @@ IGNORED_DIRECTORIES = {
     ".pytest_cache",
     "dist",
     "build",
+}
+MINI_IGNORED_DIRECTORIES = IGNORED_DIRECTORIES | {
+    ".aws",
+    ".config",
+    ".gnupg",
+    ".secrets",
+    ".ssh",
+    "secrets",
 }
 
 
@@ -758,6 +770,278 @@ def create_model(provider: str, model: str) -> Model:
     raise AgentError(f"Unsupported LLM_PROVIDER: {provider}. Use gemini or openai.")
 
 
+def mini_model_name(provider: str, model: str) -> str:
+    """Return a LiteLLM model name with an explicit provider prefix."""
+    if "/" in model:
+        return model
+    prefix = "gemini" if provider == "gemini" else "openai"
+    return f"{prefix}/{model}"
+
+
+def mini_docker_run_args(root: Path) -> list[str]:
+    """Build the mini agent's isolated, repository-only Docker arguments."""
+    return [
+        "--rm",
+        "--network",
+        "none",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev",
+        "-v",
+        f"{root.resolve()}:/workspace:rw",
+    ]
+
+
+def _mini_copy_ignore(path: str, names: list[str], root: Path) -> list[str]:
+    ignored: list[str] = []
+    source = Path(path)
+    for name in names:
+        relative = (source / name).relative_to(root)
+        if (
+            name == ".git"
+            or any(part in MINI_IGNORED_DIRECTORIES for part in relative.parts)
+            or _is_secret_path(relative)
+        ):
+            ignored.append(name)
+    return ignored
+
+
+def _mini_snapshot(root: Path) -> dict[str, bytes]:
+    """Capture files that may be synchronized from the mini sandbox."""
+    files: dict[str, bytes] = {}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if ".git" in relative.parts or any(
+            part in MINI_IGNORED_DIRECTORIES for part in relative.parts
+        ):
+            continue
+        if path.is_symlink():
+            raise AgentError(
+                f"The mini engine does not support symlinks in the checkout: {relative}"
+            )
+        if path.is_file():
+            files[relative.as_posix()] = path.read_bytes()
+    return files
+
+
+def _reject_mini_symlinks(root: Path) -> None:
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if ".git" in relative.parts or any(
+            part in MINI_IGNORED_DIRECTORIES for part in relative.parts
+        ):
+            continue
+        if path.is_symlink():
+            raise AgentError(
+                f"The mini engine does not support symlinks in the checkout: {relative}"
+            )
+
+
+def _prepare_mini_sandbox(root: Path) -> tuple[Path, Path, dict[str, bytes]]:
+    """Copy the safe part of a checkout into a temporary sandbox directory."""
+    _reject_mini_symlinks(root)
+    sandbox_directory = Path(
+        tempfile.mkdtemp(prefix="mini-sandbox-", dir=tempfile.gettempdir())
+    )
+    sandbox_root = sandbox_directory / "workspace"
+    try:
+        shutil.copytree(
+            root,
+            sandbox_root,
+            symlinks=True,
+            ignore=lambda path, names: _mini_copy_ignore(path, names, root),
+        )
+        before = _mini_snapshot(sandbox_root)
+    except Exception:
+        shutil.rmtree(sandbox_directory, ignore_errors=True)
+        raise
+    return sandbox_directory, sandbox_root, before
+
+
+def _sync_mini_sandbox(
+    root: Path,
+    sandbox_root: Path,
+    before: dict[str, bytes],
+) -> None:
+    """Copy safe mini-agent changes back and reject protected-file changes."""
+    after = _mini_snapshot(sandbox_root)
+    changed = {
+        relative
+        for relative in set(before) | set(after)
+        if before.get(relative) != after.get(relative)
+    }
+    protected = sorted(
+        relative
+        for relative in changed
+        if _is_protected_path(Path(relative)) or _is_secret_path(Path(relative))
+    )
+    if protected:
+        raise AgentError(
+            "The mini agent changed protected workflow or credential paths; "
+            "no pull request will be created:\n" + "\n".join(protected)
+        )
+
+    for relative in changed:
+        target = root / relative
+        if relative in after:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(after[relative])
+        elif target.exists():
+            target.unlink()
+
+
+def run_mini_agent(
+    root: Path,
+    issue: dict[str, Any],
+    *,
+    provider: str,
+    model: str,
+    max_steps: int,
+    log: Callable[[str], None] = print,
+) -> AgentResult:
+    """Run mini-SWE-agent as an optional, Docker-isolated inner agent.
+
+    The outer harness still owns branch creation, validation, testing, commits,
+    pushes, and pull requests. The mini agent only edits a temporary checkout copy.
+    """
+    if shutil.which("docker") is None:
+        raise AgentError(
+            "The mini engine requires Docker. Install Docker and build the sandbox "
+            "image with: docker build -f Dockerfile.agent -t agent-fix-sandbox:latest ."
+        )
+
+    if provider == "gemini" and not os.environ.get("GEMINI_API_KEY"):
+        raise AgentError("GEMINI_API_KEY is not set")
+    if provider == "openai" and not os.environ.get("OPENAI_API_KEY"):
+        raise AgentError("OPENAI_API_KEY is not set")
+
+    try:
+        from minisweagent.agents.default import DefaultAgent
+        from minisweagent.environments.docker import DockerEnvironment
+        from minisweagent.models.litellm_model import LitellmModel
+    except ImportError as exc:
+        raise AgentError(
+            "The mini engine is not installed. Run: "
+            "python -m pip install -r requirements-mini.txt"
+        ) from exc
+
+    image = os.environ.get("MINI_DOCKER_IMAGE", MINI_DEFAULT_IMAGE)
+    try:
+        cost_limit = float(
+            os.environ.get("MINI_COST_LIMIT", str(MINI_DEFAULT_COST_LIMIT))
+        )
+    except ValueError as exc:
+        raise AgentError("MINI_COST_LIMIT must be a number") from exc
+
+    mini_model = LitellmModel(
+        model_name=mini_model_name(provider, model),
+        model_kwargs={"temperature": 0},
+    )
+    sandbox_directory, sandbox_root, sandbox_before = _prepare_mini_sandbox(root)
+    try:
+        environment = DockerEnvironment(
+            image=image,
+            cwd="/workspace",
+            env={
+                "CI": "true",
+                "HOME": "/tmp/agent-home",
+                "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                "PIP_PROGRESS_BAR": "off",
+                "TQDM_DISABLE": "1",
+            },
+            # Never forward GH_TOKEN, GEMINI_API_KEY, OPENAI_API_KEY, or any other
+            # host variable into the shell that the model controls.
+            forward_env=[],
+            run_args=mini_docker_run_args(sandbox_root),
+            timeout=120,
+            container_timeout="2h",
+        )
+    except Exception as exc:
+        shutil.rmtree(sandbox_directory, ignore_errors=True)
+        raise AgentError(
+            f"Could not start the mini Docker sandbox using image {image}: {exc}"
+        ) from exc
+
+    system_template = """
+You are a focused software engineer working in /workspace.
+
+Solve the GitHub issue below with the smallest correct change. You may inspect,
+edit, and test files in /workspace using bash. Work directly on the provided
+checkout copy. Do not use git, commit, push, open pull requests, access the network, or inspect
+credentials. Do not modify .github/workflows, .github/actions, .env files, or
+private-key files. Run the repository's tests after editing.
+
+When the fix is complete and tests have passed, make one final shell action whose
+first output line is exactly COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT. Put a concise
+summary of the change and the tests on the following output lines. For example:
+printf '%s\\n' COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
+printf '%s\\n' 'Summary: ...' 'Tests: ...'
+""".strip()
+    instance_template = "{{ task }}"
+    task = (
+        f"GitHub issue #{issue['number']}\n"
+        f"Title: {issue.get('title', '')}\n\n"
+        f"Description:\n{issue.get('body') or '(no issue description)'}\n\n"
+        "Make the implementation change in the current checkout, verify it with tests, "
+        "and then submit the final summary command."
+    )
+
+    trajectory_directory = Path(
+        tempfile.mkdtemp(prefix="mini-swe-agent-", dir=tempfile.gettempdir())
+    )
+    trajectory_path = trajectory_directory / "trajectory.json"
+    agent = DefaultAgent(
+        mini_model,
+        environment,
+        system_template=system_template,
+        instance_template=instance_template,
+        step_limit=max_steps,
+        cost_limit=cost_limit,
+        wall_time_limit_seconds=600,
+        output_path=trajectory_path,
+    )
+    log(
+        f"Running mini-SWE-agent with model {mini_model_name(provider, model)} "
+        f"in Docker image {image}"
+    )
+    outcome: dict[str, Any] | None = None
+    run_error: Exception | None = None
+    try:
+        outcome = agent.run(task)
+    except Exception as exc:
+        run_error = exc
+    finally:
+        environment.cleanup()
+
+    try:
+        _sync_mini_sandbox(root, sandbox_root, sandbox_before)
+    finally:
+        shutil.rmtree(trajectory_directory, ignore_errors=True)
+        shutil.rmtree(sandbox_directory, ignore_errors=True)
+
+    if run_error is not None:
+        raise AgentError(f"mini-SWE-agent failed: {run_error}") from run_error
+    if outcome is None:
+        raise AgentError("mini-SWE-agent returned no result")
+
+    status = str(outcome.get("exit_status") or "unknown")
+    submission = str(outcome.get("submission") or "").strip()
+    if submission:
+        summary = submission
+    else:
+        changed = _run_process(
+            ["git", "diff", "--stat"], cwd=root, check=False
+        ).strip()
+        summary = (
+            f"mini-SWE-agent stopped with status {status} after {agent.n_calls} "
+            "model calls.\n\n"
+            f"Changed files:\n{changed or '(no tracked-file diff reported)'}\n\n"
+            "The harness will run the final tests before creating a pull request."
+        )
+    return AgentResult(summary, agent.n_calls)
+
+
 @dataclass
 class AgentResult:
     final_message: str
@@ -1136,6 +1420,9 @@ def create_pr(root: Path, issue: dict[str, Any], branch: str, summary: str) -> s
 
 def build_parser() -> argparse.ArgumentParser:
     provider = os.environ.get("LLM_PROVIDER", DEFAULT_PROVIDER).lower()
+    engine = os.environ.get("AGENT_ENGINE", DEFAULT_ENGINE).lower()
+    if engine not in {"custom", "mini"}:
+        engine = DEFAULT_ENGINE
     if provider == "openai":
         default_model = os.environ.get("OPENAI_MODEL") or DEFAULT_OPENAI_MODEL
     else:
@@ -1152,6 +1439,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="Run the agent and tests, then print the diff without committing, pushing, or opening a PR",
+    )
+    parser.add_argument(
+        "--engine",
+        default=engine,
+        choices=["custom", "mini"],
+        help="Agent engine (default: $AGENT_ENGINE or custom)",
     )
     parser.add_argument(
         "--max-steps",
@@ -1181,6 +1474,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.verbose:
+        print(f"Engine: {args.engine}")
         print(f"Provider: {args.provider}")
         print(f"Model: {args.model}")
         print(f"Max steps: {args.max_steps}")
@@ -1209,17 +1503,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Created branch {branch}")
 
     workspace = RepoWorkspace(root)
-    runner = AgentRunner(
-        workspace,
-        create_model(args.provider, args.model),
-        max_steps=args.max_steps,
-        request_delay=(
-            float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
-            if args.provider == "gemini"
-            else 0.0
-        ),
-    )
-    result = runner.run(issue)
+    if args.engine == "mini":
+        result = run_mini_agent(
+            root,
+            issue,
+            provider=args.provider,
+            model=args.model,
+            max_steps=args.max_steps,
+        )
+    else:
+        runner = AgentRunner(
+            workspace,
+            create_model(args.provider, args.model),
+            max_steps=args.max_steps,
+            request_delay=(
+                float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
+                if args.provider == "gemini"
+                else 0.0
+            ),
+        )
+        result = runner.run(issue)
 
     print("\nAgent finished:")
     print(result.final_message)
@@ -1239,7 +1542,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     print("\nCreating pull request...")
-    pr_url = create_pr(root, issue, branch, result.final_message)
+    final_command = " ".join(str(part) for part in test_result.get("command", []))
+    pr_summary = (
+        f"{result.final_message}\n\n"
+        f"Final validation passed: `{final_command or 'configured test command'}`"
+    )
+    pr_url = create_pr(root, issue, branch, pr_summary)
     print(f"Pull request created: {pr_url}")
     return 0
 

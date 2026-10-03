@@ -1,0 +1,3 @@
+# Optional experimental engine. Keep this separate so the default Gemini tool
+# loop and CI do not install mini-SWE-agent or its larger dependency tree.
+mini-swe-agent==2.4.6

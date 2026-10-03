@@ -36,6 +36,7 @@ MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
+MINI_EDIT_DEADLINE_CALL = 5
 TEST_ENV_ALLOWLIST = {
     "CI",
     "HOME",
@@ -793,6 +794,21 @@ def mini_docker_run_args(root: Path) -> list[str]:
     ]
 
 
+def mini_command_makes_edit(command: str) -> bool:
+    """Recognize common shell commands that can modify repository files."""
+    patterns = (
+        r"\bsed\s+-i\b",
+        r"\bperl\s+-i\b",
+        r"\b(?:apply_patch|patch)\b",
+        r"\b(?:cp|mv|rm|tee|touch|mkdir)\b",
+        r"(?:cat|echo|printf)\b[^\n;]*>{1,2}",
+        r"\bpython(?:\d+(?:\.\d+)?)?\s+(?:-c|-)(?:\s|$).*"
+        r"(?:open\(|write_text|write_bytes|\.write\()",
+        r"\bgit\s+(?:apply|checkout|restore)\b",
+    )
+    return any(re.search(pattern, command, re.IGNORECASE | re.DOTALL) for pattern in patterns)
+
+
 def _mini_copy_ignore(path: str, names: list[str], root: Path) -> list[str]:
     ignored: list[str] = []
     source = Path(path)
@@ -926,6 +942,60 @@ def run_mini_agent(
             "python -m pip install -r requirements-mini.txt"
         ) from exc
 
+    class FocusedMiniAgent(DefaultAgent):
+        """Add a hard implementation deadline to mini's bash loop."""
+
+        def __init__(self, *args: Any, **kwargs: Any):
+            self.edit_made = False
+            super().__init__(*args, **kwargs)
+
+        def query(self) -> dict[str, Any]:
+            if not self.edit_made and self.n_calls >= MINI_EDIT_DEADLINE_CALL - 1:
+                if self.n_calls >= MINI_EDIT_DEADLINE_CALL:
+                    message = (
+                        "Implementation deadline reached. Read-only commands are blocked "
+                        "until you edit a source or test file. Issue one edit command now."
+                    )
+                else:
+                    message = (
+                        "You have used most of the investigation budget. Make the smallest "
+                        "reasonable edit on this call, then run tests; do not keep exploring."
+                    )
+                self.add_messages(self.model.format_message(role="user", content=message))
+            return super().query()
+
+        def execute_actions(self, message: dict) -> list[dict]:
+            outputs: list[dict[str, Any]] = []
+            for action in message.get("extra", {}).get("actions", []):
+                command = str(action.get("command", ""))
+                if (
+                    not self.edit_made
+                    and self.n_calls >= MINI_EDIT_DEADLINE_CALL
+                    and not mini_command_makes_edit(command)
+                ):
+                    outputs.append(
+                        {
+                            "output": (
+                                "Blocked: you have reached the implementation deadline. "
+                                "Use one shell command that edits the source or test file now."
+                            ),
+                            "returncode": 1,
+                            "exception_info": "",
+                        }
+                    )
+                    continue
+
+                output = self.env.execute(action)
+                outputs.append(output)
+                if output.get("returncode") == 0 and mini_command_makes_edit(command):
+                    self.edit_made = True
+
+            return self.add_messages(
+                *self.model.format_observation_messages(
+                    message, outputs, self.get_template_vars()
+                )
+            )
+
     image = os.environ.get("MINI_DOCKER_IMAGE", MINI_DEFAULT_IMAGE)
     try:
         cost_limit = float(
@@ -991,7 +1061,7 @@ printf '%s\\n' 'Summary: ...' 'Tests: ...'
         tempfile.mkdtemp(prefix="mini-swe-agent-", dir=tempfile.gettempdir())
     )
     trajectory_path = trajectory_directory / "trajectory.json"
-    agent = DefaultAgent(
+    agent = FocusedMiniAgent(
         mini_model,
         environment,
         system_template=system_template,

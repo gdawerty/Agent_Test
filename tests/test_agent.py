@@ -19,6 +19,7 @@ from agent import (
     _sync_mini_sandbox,
     find_open_issue_pr,
     final_test_status,
+    mini_command_makes_edit,
     mini_docker_run_args,
     mini_model_name,
 )
@@ -92,6 +93,13 @@ class AgentTests(unittest.TestCase):
         self.assertIn(f"{repository}:/workspace:rw", docker_args)
         self.assertNotIn("GEMINI_API_KEY", docker_args)
         self.assertNotIn("GH_TOKEN", docker_args)
+        self.assertFalse(mini_command_makes_edit("rg -n argparse agent.py"))
+        self.assertTrue(mini_command_makes_edit("sed -i 's/old/new/' agent.py"))
+        self.assertTrue(
+            mini_command_makes_edit(
+                "python - <<'PY'\nPath('agent.py').write_text('updated')\nPY"
+            )
+        )
 
     def test_mini_sandbox_excludes_credentials_and_syncs_safe_changes(self):
         with tempfile.TemporaryDirectory() as directory:

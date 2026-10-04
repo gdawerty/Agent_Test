@@ -28,6 +28,7 @@ from agent import (
     mini_test_command,
     mini_command_makes_edit,
     mini_docker_run_args,
+    mini_model_kwargs,
     mini_model_name,
 )
 
@@ -190,6 +191,11 @@ class AgentTests(unittest.TestCase):
             "gemini/gemini-3.5-flash-lite",
         )
         self.assertEqual(mini_model_name("openai", "openai/gpt-5"), "openai/gpt-5")
+        self.assertEqual(
+            mini_model_kwargs("openai"),
+            {"reasoning_effort": "none", "temperature": 0},
+        )
+        self.assertEqual(mini_model_kwargs("gemini"), {"temperature": 0})
         repository = Path("/tmp/example-repository").resolve()
         docker_args = mini_docker_run_args(repository)
         self.assertIn("none", docker_args)

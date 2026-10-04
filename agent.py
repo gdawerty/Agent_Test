@@ -1034,6 +1034,18 @@ def mini_model_name(provider: str, model: str) -> str:
     return f"{prefix}/{model}"
 
 
+def mini_model_kwargs(provider: str) -> dict[str, Any]:
+    """Return provider-safe sampling settings for mini-SWE-agent.
+
+    OpenAI reasoning models reject ``temperature=0`` while reasoning is
+    enabled.  Disable reasoning explicitly so Luna can run as a low-cost,
+    deterministic implementation model.  Gemini keeps the existing setting.
+    """
+    if provider == "openai":
+        return {"reasoning_effort": "none", "temperature": 0}
+    return {"temperature": 0}
+
+
 def mini_docker_run_args(root: Path) -> list[str]:
     """Build the mini agent's isolated, repository-only Docker arguments."""
     args = [
@@ -1361,7 +1373,7 @@ def run_mini_agent(
 
     mini_model = LitellmModel(
         model_name=mini_model_name(provider, model),
-        model_kwargs={"temperature": 0},
+        model_kwargs=mini_model_kwargs(provider),
     )
     sandbox_directory, sandbox_root, sandbox_before = _prepare_mini_sandbox(root)
     try:

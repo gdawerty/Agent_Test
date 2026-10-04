@@ -45,7 +45,8 @@ REPOSITORY_INDEX_VERSION = 1
 MAX_INDEX_SYMBOLS = 250
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
-MINI_MAX_CALLS = 4
+MINI_MAX_CALLS = 12
+MINI_FALLBACK_ENABLED = False
 MINI_EDIT_DEADLINE_CALL = 4
 MINI_STALL_CALLS = 3
 TEST_ENV_ALLOWLIST = {
@@ -2062,6 +2063,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             budget=budget,
         )
         if not has_worktree_changes(root):
+            if not MINI_FALLBACK_ENABLED:
+                raise AgentError(
+                    "mini-SWE-agent made no edit; the fallback tool agent is disabled."
+                )
             if budget.remaining <= 0:
                 raise AgentError(
                     "The global model-call budget was exhausted without an edit; "

@@ -622,11 +622,7 @@ class RepoWorkspace:
         if (self.root / "go.mod").exists():
             return ["go", "test", "./..."]
 
-        python_test_config = any(
-            (self.root / name).exists()
-            for name in ("pytest.ini", "tox.ini", "setup.cfg")
-        )
-        if python_test_config:
+        if any((self.root / name).exists() for name in ("pytest.ini", "tox.ini", "setup.cfg")):
             return [sys.executable, "-m", "pytest", "-q"]
 
         tests_directory = self.root / "tests"

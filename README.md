@@ -55,7 +55,7 @@ Create a small issue in the target repository, for example one describing a fail
 
 ```bash
 git status --short
-python agent.py 12 --dry-run
+python agent.py 12 --dry-run --max-diff-lines 200
 ```
 
 Dry-run still fetches the issue and calls the model, and it can edit the checkout. It does not create a branch, commit, push, or pull request. Review the printed diff, then restore the disposable clone before trying again.
@@ -66,7 +66,7 @@ For the full issue-to-PR flow:
 python agent.py 12
 ```
 
-This creates `agent/issue-12`, runs the agent, runs the detected test command one final time, commits the changes, pushes the branch, and opens a PR with `Fixes #12`. If the final tests fail or the agent makes no changes, it stops before creating the PR.
+This creates `agent/issue-12`, runs the agent, runs the detected test command one final time, commits the changes, pushes the branch, and opens a PR with `Fixes #12`. If the final tests fail, the agent makes no changes, or the added and removed lines exceed `--max-diff-lines` (200 by default), it stops before committing, pushing, or creating the PR. The limit counts tracked and untracked files.
 
 The test command is detected in this order: `TEST_COMMAND`, `npm test`, `cargo test`, `go test ./...`, pytest configuration, and Python `unittest` tests under `tests/`. For an existing project, set the exact command explicitly when detection is not appropriate:
 

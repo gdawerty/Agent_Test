@@ -33,6 +33,7 @@ GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 12
+DEFAULT_MAX_DIFF_LINES = 200
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
 PHASE_BUDGETS = {
@@ -1921,6 +1922,38 @@ def _changed_paths(root: Path) -> set[str]:
     return paths
 
 
+def count_changed_lines(root: Path) -> int:
+    """Count added and removed lines across tracked and untracked changes."""
+    diff = _run_process(
+        ["git", "diff", "--no-ext-diff", "--unified=0", "--no-color", "HEAD", "--"],
+        cwd=root,
+        check=False,
+    )
+    count = 0
+    for line in diff.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith(("+", "-")):
+            count += 1
+
+    untracked = _run_process(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=root,
+        check=False,
+    )
+    for name in untracked.split("\0"):
+        if not name:
+            continue
+        path = root / name
+        try:
+            content = path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" not in content:
+            count += sum(1 for line in content.splitlines() if line)
+    return count
+
+
 def validate_agent_changes(root: Path) -> None:
     protected = sorted(
         path for path in _changed_paths(root) if _is_protected_path(Path(path))
@@ -2095,6 +2128,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Agent engine (default: $AGENT_ENGINE or custom)",
     )
     parser.add_argument(
+        "--max-diff-lines",
+        type=int,
+        default=DEFAULT_MAX_DIFF_LINES,
+        help=f"Maximum added and removed lines allowed (default: {DEFAULT_MAX_DIFF_LINES})",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=MAX_STEPS,
@@ -2134,6 +2173,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise AgentError("issue_number must be positive")
     if args.max_steps <= 0:
         raise AgentError("max_steps must be positive")
+    if args.max_diff_lines < 0:
+        raise AgentError("max_diff_lines must be non-negative")
 
     budget = RunBudget(args.max_steps)
 
@@ -2205,6 +2246,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("\nAgent finished:")
     print(result.final_message)
     validate_agent_changes(root)
+    changed_lines = count_changed_lines(root)
+    if changed_lines > args.max_diff_lines:
+        raise AgentError(
+            f"Automated changes exceed the maximum diff size: limit is "
+            f"{args.max_diff_lines} lines, actual changed lines: {changed_lines}. "
+            "No commit, push, or pull request was created."
+        )
     test_result = final_test_status(workspace)
     print(f"\nFinal tests: {json.dumps(test_result)}")
 

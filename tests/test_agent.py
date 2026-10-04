@@ -20,6 +20,7 @@ from agent import (
     _mini_snapshot,
     _sync_mini_sandbox,
     build_repository_index,
+    count_changed_lines,
     find_open_issue_pr,
     final_test_status,
     has_worktree_changes,
@@ -174,6 +175,28 @@ class AgentTests(unittest.TestCase):
             self.assertIn("VALUE", rendered)
             self.assertNotIn(".env", rendered)
             self.assertNotIn("do-not-index", rendered)
+
+    def test_count_changed_lines_includes_tracked_and_untracked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "tracked.txt").write_text("one\ntwo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"],
+                cwd=root, check=True, capture_output=True,
+            )
+            (root / "tracked.txt").write_text("one\nchanged\n", encoding="utf-8")
+            self.assertEqual(count_changed_lines(root), 2)
+            self.assertEqual(count_changed_lines(root), 2)  # below a limit of 3
+            (root / "new.txt").write_text("new line\nanother\n", encoding="utf-8")
+            self.assertEqual(count_changed_lines(root), 4)
+
+    def test_max_diff_lines_cli_option_and_default(self):
+        from agent import build_parser
+        parser = build_parser()
+        self.assertEqual(parser.parse_args(["12"]).max_diff_lines, 200)
+        self.assertEqual(parser.parse_args(["12", "--max-diff-lines", "17"]).max_diff_lines, 17)
 
     def test_verbose_flag(self):
         from agent import build_parser

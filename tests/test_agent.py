@@ -108,7 +108,7 @@ class AgentTests(unittest.TestCase):
                 def __init__(self):
                     self.calls = 0
 
-                def create(self, *, instructions, input_items, tools):
+                def create(self, *, instructions, input_items, tools, tool_choice=None):
                     self.calls += 1
                     return FakeResponse(
                         output=[
@@ -329,14 +329,14 @@ class AgentTests(unittest.TestCase):
                     self.calls = 0
                     self.available_tools = []
 
-                def create(self, *, instructions, input_items, tools):
+                def create(
+                    self, *, instructions, input_items, tools, tool_choice=None
+                ):
                     self.calls += 1
                     self.available_tools.append({tool["name"] for tool in tools})
                     scripts = [
                         ("search_code", {"query": "VALUE"}),
                         ("search_code", {"query": "VALUE"}),
-                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
-                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         (
@@ -365,15 +365,15 @@ class AgentTests(unittest.TestCase):
             model = WanderingModel()
             result = AgentRunner(
                 RepoWorkspace(root), model, max_steps=7, log=lambda _: None
-            ).run({"number": 9, "title": "Fix value", "body": "Fix it."})
+                ).run({"number": 9, "title": "Fix value", "body": "Fix it."})
 
-            self.assertEqual(result.steps, 7)
+            self.assertEqual(result.steps, 6)
             self.assertNotIn("search_code", model.available_tools[2])
             self.assertEqual(
-                model.available_tools[5], {"read_file", "edit_file"}
+                model.available_tools[3], {"read_file", "edit_file"}
             )
             self.assertEqual(
-                model.available_tools[6], {"read_file", "edit_file"}
+                model.available_tools[4], {"edit_file"}
             )
             self.assertEqual(
                 (root / "app.py").read_text(encoding="utf-8"),
@@ -416,14 +416,14 @@ class AgentTests(unittest.TestCase):
                     self.tools_by_call.append({tool["name"] for tool in tools})
                     self.choices.append(tool_choice)
                     self.input_lengths.append(len(input_items))
-                    if self.calls <= 8:
+                    if self.calls <= 4:
                         name = "read_file"
                         arguments = {
                             "path": "app.py",
                             "start_line": 1,
-                            "end_line": 1,
+                            "end_line": self.calls,
                         }
-                    elif self.calls == 9:
+                    elif self.calls == 5:
                         name = "edit_file"
                         arguments = {
                             "path": "app.py",
@@ -445,16 +445,18 @@ class AgentTests(unittest.TestCase):
 
             model = PhaseModel()
             result = AgentRunner(
-                RepoWorkspace(root), model, max_steps=10, log=lambda _: None
+                RepoWorkspace(root), model, max_steps=6, log=lambda _: None
             ).run({"number": 10, "title": "Fix value", "body": "Fix it."})
 
-            self.assertEqual(result.steps, 10)
-            self.assertEqual(model.tools_by_call[7], {"read_file", "edit_file"})
-            self.assertEqual(model.tools_by_call[8], {"edit_file"})
-            self.assertIsNone(model.choices[7])
-            self.assertEqual(model.input_lengths[8], 1)
+            self.assertEqual(result.steps, 6)
             self.assertEqual(
-                model.choices[8],
+                model.tools_by_call[3], {"search_code", "read_file", "edit_file"}
+            )
+            self.assertEqual(model.tools_by_call[4], {"edit_file"})
+            self.assertIsNone(model.choices[3])
+            self.assertEqual(model.input_lengths[4], 1)
+            self.assertEqual(
+                model.choices[4],
                 {"type": "function", "function": {"name": "edit_file"}},
             )
             self.assertEqual(
@@ -496,28 +498,28 @@ class AgentTests(unittest.TestCase):
                     self.calls += 1
                     self.tools_by_call.append({tool["name"] for tool in tools})
                     self.choices.append(tool_choice)
-                    if self.calls <= 8:
+                    if self.calls <= 4:
                         name = "read_file"
                         arguments = {
                             "path": "app.py",
                             "start_line": 1,
-                            "end_line": 1,
+                            "end_line": self.calls,
                         }
-                    elif self.calls == 9:
+                    elif self.calls == 5:
                         name = "edit_file"
                         arguments = {
                             "path": "app.py",
                             "old_text": "VALUE = 'stale'\n",
                             "new_text": "VALUE = 'fixed'\n",
                         }
-                    elif self.calls == 10:
+                    elif self.calls == 6:
                         name = "read_file"
                         arguments = {
                             "path": "app.py",
                             "start_line": 1,
                             "end_line": 1,
                         }
-                    elif self.calls == 11:
+                    elif self.calls == 7:
                         name = "edit_file"
                         arguments = {
                             "path": "app.py",
@@ -539,15 +541,16 @@ class AgentTests(unittest.TestCase):
 
             model = RecoveryModel()
             result = AgentRunner(
-                RepoWorkspace(root), model, max_steps=12, log=lambda _: None
+                RepoWorkspace(root), model, max_steps=8, log=lambda _: None
             ).run({"number": 11, "title": "Fix value", "body": "Fix it."})
 
-            self.assertEqual(result.steps, 12)
-            self.assertEqual(model.tools_by_call[9], {"read_file", "edit_file"})
-            self.assertEqual(model.tools_by_call[10], {"edit_file"})
-            self.assertIsNone(model.choices[9])
+            self.assertEqual(result.steps, 8)
+            self.assertEqual(model.tools_by_call[4], {"edit_file"})
+            self.assertEqual(model.tools_by_call[5], {"read_file", "edit_file"})
+            self.assertEqual(model.tools_by_call[6], {"edit_file"})
+            self.assertIsNone(model.choices[5])
             self.assertEqual(
-                model.choices[10],
+                model.choices[6],
                 {"type": "function", "function": {"name": "edit_file"}},
             )
             self.assertEqual(

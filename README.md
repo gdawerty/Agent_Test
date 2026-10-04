@@ -11,7 +11,9 @@ This repository contains a small issue-to-pull-request agent. It fetches one Git
 
 The initial issue context includes a deterministic Python repository map with files, classes, functions, methods, tests, and line ranges. The model cannot run `git`, create commits, push, or open pull requests. The Python harness performs those actions only after the agent stops, the worktree has a diff, and a final test run passes. Gemini uses Google's OpenAI-compatible Chat Completions endpoint for the tool loop. Existing files are changed with exact small replacements through `edit_file`, which keeps the agent's requests smaller.
 
-The agent has fifteen paced model calls by default and receives its current turn and remaining budget on every request. If the mini engine is selected and does not produce a change, the focused engine receives only the unused calls from that same global budget. If it uses its final call to make a change, the harness still runs the final tests and prepares the pull request when they pass.
+The agent has twelve paced model calls by default and receives its current phase and remaining budget on every request. Investigation, implementation, repair, and verification have separate budgets, so exploration cannot consume the calls reserved for editing. If the mini engine is selected and does not produce a change, the focused engine receives only the unused calls from that same global budget. If it uses its final call to make a change, the harness still runs the final tests and prepares the pull request when they pass.
+
+The default custom phase budgets are 4 investigation calls, 3 implementation calls, 3 repair calls, and 2 verification/finalization calls. Repeated identical reads or searches are reported as already observed. The mini engine is limited to 6 calls before the remaining global budget can be offered to the focused engine.
 
 The harness also limits exploration: the model gets at most two code searches, loses search access after editing, and can use targeted reads during the investigation phase. Starting at the implementation checkpoint, the provider is explicitly asked for `edit_file` and receives no read or search tool. If an exact replacement fails, one recovery turn can read the affected code before the next edit attempt. A shared run budget covers every engine, including mini-to-custom fallback, so fallback cannot silently start a second full budget.
 
@@ -29,7 +31,7 @@ gh auth login
 export GEMINI_API_KEY="your-gemini-key"
 ```
 
-Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most fifteen model calls and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
+Gemini is the default provider and `gemini-3.5-flash-lite` is the default model. The agent uses at most twelve model calls and spaces Gemini requests by five seconds by default. Set `GEMINI_MODEL` if needed. To use OpenAI instead:
 
 ```bash
 export LLM_PROVIDER=openai
@@ -102,7 +104,7 @@ Run it locally from a clean checkout with a real issue number:
 
 ```bash
 export GEMINI_API_KEY="your-gemini-key"
-python agent.py 12 --engine mini --max-steps 15 --dry-run
+python agent.py 12 --engine mini --max-steps 12 --dry-run
 ```
 
 The Docker container has no network, receives no `GH_TOKEN`, `GITHUB_TOKEN`, `GEMINI_API_KEY`, or `OPENAI_API_KEY`, and mounts a temporary copy at `/workspace`. The copy excludes `.git`, ignored virtualenv/build directories, and credential-looking files; safe changes are synchronized back after the run. The outer process still rejects protected-file changes and requires a passing final test run before creating a PR. This is an experimental containment boundary, not a complete security sandbox.

@@ -32,15 +32,21 @@ DEFAULT_ENGINE = "custom"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
-MAX_STEPS = 15
+MAX_STEPS = 12
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
-CUSTOM_IMPLEMENTATION_CALL = 9
+PHASE_BUDGETS = {
+    "investigate": 4,
+    "implement": 3,
+    "repair": 3,
+    "verify": 2,
+}
 REPOSITORY_INDEX_VERSION = 1
 MAX_INDEX_SYMBOLS = 250
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
-MINI_EDIT_DEADLINE_CALL = 7
+MINI_MAX_CALLS = 6
+MINI_EDIT_DEADLINE_CALL = 4
 MINI_STALL_CALLS = 3
 TEST_ENV_ALLOWLIST = {
     "CI",
@@ -109,14 +115,30 @@ class RunBudget:
     max_model_calls: int
     model_calls_used: int = 0
     calls_by_phase: dict[str, int] = field(default_factory=dict)
+    phase_limits: dict[str, int] = field(
+        default_factory=lambda: dict(PHASE_BUDGETS)
+    )
 
     @property
     def remaining(self) -> int:
         return max(0, self.max_model_calls - self.model_calls_used)
 
+    def phase_remaining(self, phase: str) -> int:
+        limit = self.phase_limits.get(phase)
+        if limit is None:
+            return self.remaining
+        return max(0, limit - self.calls_by_phase.get(phase, 0))
+
     def consume(self, count: int = 1, *, phase: str) -> None:
         if count < 0:
             raise ValueError("count must not be negative")
+        phase_limit = self.phase_limits.get(phase)
+        phase_used = self.calls_by_phase.get(phase, 0)
+        if phase_limit is not None and phase_used + count > phase_limit:
+            raise AgentError(
+                f"{phase} phase budget exhausted "
+                f"({phase_used}/{phase_limit} calls used)."
+            )
         if self.model_calls_used + count > self.max_model_calls:
             raise AgentError(
                 f"Global model-call budget exhausted before {phase} could continue "
@@ -1476,51 +1498,72 @@ class AgentRunner:
                 "content": initial_prompt,
             }
         ]
+        budget = self.budget or RunBudget(self.max_steps)
         search_calls = 0
         edit_made = False
+        phase = "investigate"
         recovery_turn = False
         observations: list[str] = []
         implementation_context_compacted = False
+        seen_actions: set[tuple[str, str]] = set()
+        stale_actions = 0
+        last_step = 0
 
         step_limit = self.max_steps
-        if self.budget is not None:
-            step_limit = min(step_limit, self.budget.remaining)
+        step_limit = min(step_limit, budget.remaining)
 
         for step in range(1, step_limit + 1):
+            while budget.phase_remaining(phase) <= 0:
+                if phase == "investigate":
+                    phase = "implement"
+                    recovery_turn = False
+                elif phase == "implement" and not edit_made:
+                    phase = "repair"
+                    recovery_turn = True
+                else:
+                    break
+            if budget.phase_remaining(phase) <= 0:
+                break
+
+            last_step = step
             self.log(f"\n--- Agent step {step} ---")
             if step > 1 and self.request_delay:
                 time.sleep(self.request_delay)
 
-            allowed_tools = TOOLS
-            if edit_made:
+            if phase == "investigate":
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] != "run_tests"
+                ]
+                if search_calls >= 2:
+                    allowed_tools = [
+                        tool
+                        for tool in allowed_tools
+                        if tool["name"] != "search_code"
+                    ]
+            elif phase == "implement":
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] == "edit_file"
+                ]
+            elif phase == "repair" and recovery_turn:
+                allowed_tools = [
+                    tool
+                    for tool in TOOLS
+                    if tool["name"] in {"read_file", "edit_file"}
+                ]
+            elif phase == "repair":
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] == "edit_file"
+                ]
+            else:
                 allowed_tools = [
                     tool
                     for tool in TOOLS
                     if tool["name"] in {"read_file", "edit_file", "run_tests"}
                 ]
-            elif search_calls >= 2:
-                allowed_tools = [
-                    tool for tool in TOOLS if tool["name"] != "search_code"
-                ]
-            implementation_phase = (
-                not edit_made and step >= CUSTOM_IMPLEMENTATION_CALL
-            )
-            if not edit_made and recovery_turn:
-                allowed_tools = [
-                    tool for tool in TOOLS if tool["name"] in {"read_file", "edit_file"}
-                ]
-            elif not edit_made and implementation_phase:
-                allowed_tools = [
-                    tool for tool in TOOLS if tool["name"] == "edit_file"
-                ]
-            elif step >= 6 and not edit_made:
-                allowed_tools = [
-                    tool
-                    for tool in allowed_tools
-                    if tool["name"] in {"read_file", "edit_file"}
-                ]
             allowed_tool_names = {tool["name"] for tool in allowed_tools}
-            force_edit = implementation_phase and not recovery_turn
+            force_edit = phase == "implement" or (
+                phase == "repair" and not recovery_turn
+            )
             tool_choice = (
                 {
                     "type": "function",
@@ -1530,7 +1573,7 @@ class AgentRunner:
                 else None
             )
 
-            if implementation_phase and not recovery_turn and not implementation_context_compacted:
+            if phase == "implement" and not implementation_context_compacted:
                 evidence = _truncate(
                     "\n\n".join(observations), MAX_TOOL_OUTPUT
                 )
@@ -1547,11 +1590,13 @@ class AgentRunner:
                 ]
                 implementation_context_compacted = True
 
-            remaining = self.max_steps - step + 1
+            remaining = min(self.max_steps - step + 1, budget.remaining)
             turn_instructions = (
                 f"{SYSTEM_PROMPT}\n\n"
-                f"CURRENT TURN: {step} of {self.max_steps}\n"
-                f"TURNS REMAINING INCLUDING THIS ONE: {remaining}\n"
+                f"PHASE: {phase.upper()}\n"
+                f"CURRENT MODEL CALL: {step} of {self.max_steps}\n"
+                f"GLOBAL CALLS REMAINING INCLUDING THIS ONE: {remaining}\n"
+                f"PHASE CALLS REMAINING: {budget.phase_remaining(phase)}\n"
                 f"SEARCH CALLS USED: {search_calls} of 2\n"
             )
             if search_calls >= 2:
@@ -1559,33 +1604,41 @@ class AgentRunner:
                     "You have exhausted your search budget. Do not continue exploring "
                     "the repository; use the information already gathered.\n"
                 )
-            if step >= 6 and not edit_made:
+            if phase == "investigate":
                 turn_instructions += (
-                    "The implementation checkpoint is approaching. Targeted reads "
-                    "are allowed, but do not repeat exploration; edit as soon as "
-                    "you have enough context.\n"
+                    "Investigate only enough to identify the likely root cause and "
+                    "target edit. Repeated observations will be rejected.\n"
                 )
-            if force_edit:
+            elif phase == "implement":
                 turn_instructions += (
-                    "You have enough repository context to implement the fix. "
+                    "Investigation is complete for this run. "
                     "Call edit_file now. Do not call a read or search tool.\n"
                 )
-            elif recovery_turn:
+            elif phase == "repair" and recovery_turn:
                 turn_instructions += (
-                    "The previous edit attempt did not apply. You may make one "
+                    "The previous edit attempt did not apply. Make one "
                     "targeted read_file call to correct the exact replacement, "
                     "then call edit_file. Do not resume general exploration.\n"
                 )
+            elif phase == "repair":
+                turn_instructions += (
+                    "Repair the current patch with edit_file now. Do not read or "
+                    "search again.\n"
+                )
+            else:
+                turn_instructions += (
+                    "Verify the change with run_tests. If a test fails, make a "
+                    "focused repair and rerun it; otherwise finish with a summary.\n"
+                )
             if remaining <= 3:
                 turn_instructions += (
-                    "Stop exploring. Edit, test, and finalize now; do not make another "
-                    "unnecessary search or read.\n"
+                    "Use the remaining calls only for implementation, testing, or "
+                    "finalizing; do not start new exploration.\n"
                 )
 
             for attempt in range(2):
                 try:
-                    if self.budget is not None:
-                        self.budget.consume(phase="custom")
+                    budget.consume(phase=phase)
                     request: dict[str, Any] = {
                         "instructions": turn_instructions,
                         "input_items": input_items,
@@ -1611,7 +1664,11 @@ class AgentRunner:
             ]
             if not tool_calls:
                 if force_edit:
-                    recovery_turn = True
+                    if phase == "implement":
+                        phase = "repair"
+                        recovery_turn = True
+                    else:
+                        recovery_turn = False
                     input_items.append(
                         {
                             "role": "user",
@@ -1634,10 +1691,14 @@ class AgentRunner:
                         }
                     )
                     continue
+                if phase == "investigate":
+                    phase = "implement"
+                    continue
                 final_message = _item_value(response, "output_text", "") or "Agent finished without a summary."
                 return AgentResult(str(final_message), step)
 
             edit_succeeded = False
+            test_failure_transition = False
             for call in tool_calls:
                 name = _item_value(call, "name")
                 raw_arguments = _item_value(call, "arguments", "{}")
@@ -1655,7 +1716,22 @@ class AgentRunner:
                         arguments = json.loads(raw_arguments)
                         if not isinstance(arguments, dict):
                             raise ValueError("tool arguments must be a JSON object")
-                        result = self.workspace.call_tool(name, arguments)
+                        action_key = (
+                            name,
+                            json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+                        )
+                        if name in {"search_code", "read_file"} and action_key in seen_actions:
+                            result = (
+                                "ALREADY_OBSERVED: this exact search or read was "
+                                "already performed. Use its existing result or edit."
+                            )
+                            stale_actions += 1
+                        else:
+                            if name in {"search_code", "read_file"}:
+                                seen_actions.add(action_key)
+                            result = self.workspace.call_tool(name, arguments)
+                            if name in {"search_code", "read_file"}:
+                                stale_actions = 0
                     except Exception as exc:
                         result = f"TOOL ERROR: {type(exc).__name__}: {exc}"
                     if name == "edit_file" and result.startswith(
@@ -1667,6 +1743,14 @@ class AgentRunner:
                         ("ERROR:", "TOOL ERROR:")
                     ):
                         observations.append(f"{name}:\n{_truncate(result, 4_000)}")
+                    elif name == "run_tests":
+                        try:
+                            if json.loads(result).get("status") == "failed":
+                                phase = "repair"
+                                recovery_turn = True
+                                test_failure_transition = True
+                        except (TypeError, json.JSONDecodeError):
+                            pass
                 self.log(_truncate(result, 1_000))
                 input_items.append(
                     {
@@ -1677,27 +1761,32 @@ class AgentRunner:
                 )
 
             if edit_succeeded:
+                phase = "verify"
                 recovery_turn = False
-            elif force_edit:
-                # A rejected or malformed forced edit gets one recovery turn. This
-                # permits a precise read without reopening unrestricted exploration.
+            elif force_edit and phase == "implement":
+                phase = "repair"
                 recovery_turn = True
-            elif recovery_turn:
-                # The recovery turn is single-use; the next turn must attempt an edit.
+            elif force_edit and phase == "repair":
                 recovery_turn = False
+            elif recovery_turn and not test_failure_transition:
+                recovery_turn = False
+            elif phase == "investigate" and stale_actions >= 2:
+                phase = "implement"
 
         if self._has_worktree_changes():
             message = (
-                f"Agent reached the maximum of {self.max_steps} steps after making "
+                f"Agent finished its phase budget after making "
                 "a change without returning a final summary.\n\n"
                 f"{self._change_summary()}\n\n"
                 "The harness will run the final tests and prepare the pull request "
                 "if they pass."
             )
             self.log(message)
-            return AgentResult(message, self.max_steps)
+            return AgentResult(message, last_step)
 
-        raise AgentError(f"Agent exceeded the maximum of {self.max_steps} steps without making a change")
+        raise AgentError(
+            "Agent exhausted its bounded phase budgets without making a change"
+        )
 
 
 def repository_root(start: Path) -> Path:
@@ -1969,7 +2058,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             issue,
             provider=args.provider,
             model=args.model,
-            max_steps=budget.remaining,
+            max_steps=min(budget.remaining, MINI_MAX_CALLS),
             budget=budget,
         )
         if not has_worktree_changes(root):

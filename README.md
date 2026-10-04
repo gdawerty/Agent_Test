@@ -36,7 +36,7 @@ Gemini is the default provider and `gemini-3.5-flash-lite` is the default model.
 ```bash
 export LLM_PROVIDER=openai
 export OPENAI_API_KEY="your-openai-key"
-export OPENAI_MODEL="gpt-5.6"
+export OPENAI_MODEL="gpt-6-luna"
 ```
 
 The repository must have a clean worktree before every run. Use a disposable clone when testing because the agent is allowed to edit files.
@@ -81,7 +81,7 @@ The included workflow supports two triggers:
 1. Run **Actions → Agent fix → Run workflow** and enter an issue number.
 2. Create an issue, review it, and add the `agent-approved` label. The agent then starts automatically for that issue.
 
-Before enabling the workflow, add an Actions repository secret named `GEMINI_API_KEY`. Optionally add `GEMINI_MODEL` as a repository variable. Set `LLM_PROVIDER` to `openai` and add `OPENAI_API_KEY` instead if you want to use OpenAI. The workflow grants the job permission to push branches and create pull requests, and uses the built-in `GH_TOKEN` for GitHub CLI authentication.
+Before enabling the workflow, add an Actions repository secret named `OPENAI_API_KEY` and optionally `GEMINI_API_KEY` as the fallback. The default workflow model chain is `openai:gpt-6-luna,gemini:gemini-3.5-flash-lite`; it uses Luna first and tries Gemini only if the OpenAI attempt fails. You can override the chain with the `AGENT_MODEL_CHAIN` repository variable. The workflow grants the job permission to push branches and create pull requests, and uses the built-in `GH_TOKEN` for GitHub CLI authentication.
 
 Only issues labeled `agent-approved` start an automatic run. The job also uses the `agent-fix` environment. Configure that environment in **Settings → Environments** with yourself or another trusted maintainer as a required reviewer; this adds a second approval gate before the runner receives the workflow credentials.
 

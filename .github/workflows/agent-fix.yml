@@ -80,8 +80,8 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-5.6' }}
-          AGENT_MODEL_CHAIN: ${{ vars.AGENT_MODEL_CHAIN || 'openai:gpt-5.4,openai:gpt-5.4-mini,gemini:gemini-3.5-flash-lite' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-6-luna' }}
+          AGENT_MODEL_CHAIN: ${{ vars.AGENT_MODEL_CHAIN || 'openai:gpt-6-luna,gemini:gemini-3.5-flash-lite' }}
           AGENT_ENGINE: ${{ vars.AGENT_ENGINE || 'custom' }}
           AGENT_MAX_STEPS: ${{ vars.AGENT_MAX_STEPS || '12' }}
           AGENT_SANDBOX_TESTS: '1'

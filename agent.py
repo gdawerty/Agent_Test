@@ -27,7 +27,7 @@ from typing import Any, Callable, Protocol, Sequence
 
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-DEFAULT_OPENAI_MODEL = "gpt-5.6"
+DEFAULT_OPENAI_MODEL = "gpt-6-luna"
 DEFAULT_ENGINE = "custom"
 DEFAULT_MODEL_CHAIN = ""
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
@@ -1040,7 +1040,7 @@ def parse_model_chain(
 
     An empty value preserves the existing single-provider configuration. Each
     non-empty entry must use ``provider:model`` syntax, for example
-    ``openai:gpt-5.4,openai:gpt-5.4-mini,gemini:gemini-3.5-flash-lite``.
+    ``openai:gpt-6-luna,gemini:gemini-3.5-flash-lite``.
     """
     if not value or not value.strip():
         return [(default_provider.lower(), default_model)]

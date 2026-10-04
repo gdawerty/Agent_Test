@@ -636,6 +636,9 @@ class RepoWorkspace:
         return None
 
     def run_tests(self) -> str:
+        if os.environ.get("AGENT_SANDBOX_TESTS") == "1":
+            return run_tests_in_sandbox(self.root)
+
         command = self._test_command()
         if command is None:
             return json.dumps(
@@ -1092,6 +1095,15 @@ def mini_docker_run_args(root: Path) -> list[str]:
         "none",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+        "--read-only",
+        "--pids-limit",
+        "256",
+        "--cpus",
+        "2",
+        "--memory",
+        "1g",
+        "--memory-swap",
+        "1g",
         "--tmpfs",
         "/tmp:rw,nosuid,nodev",
         "-v",
@@ -1159,6 +1171,75 @@ def mini_test_command(root: Path) -> str:
     if command[0] == sys.executable:
         command = ["python3", *command[1:]]
     return shlex.join(command)
+
+
+def run_tests_in_sandbox(root: Path, *, image: str = MINI_DEFAULT_IMAGE) -> str:
+    """Run repository-controlled tests without host credentials or networking."""
+    command = RepoWorkspace(root)._test_command()
+    if command is None:
+        return json.dumps(
+            {
+                "status": "skipped",
+                "reason": "No supported test command detected. Set TEST_COMMAND to configure one.",
+            }
+        )
+    if shutil.which("docker") is None:
+        return json.dumps(
+            {
+                "status": "failed",
+                "command": command,
+                "output": "Docker is required when AGENT_SANDBOX_TESTS=1",
+            }
+        )
+
+    if command[0] == sys.executable:
+        command = ["python3", *command[1:]]
+    sandbox_directory, sandbox_root, _ = _prepare_mini_sandbox(root)
+    docker_command = [
+        "docker",
+        "run",
+        *mini_docker_run_args(sandbox_root),
+        "--env",
+        "CI=true",
+        "--env",
+        "HOME=/tmp/agent-home",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
+        image,
+        "bash",
+        "-lc",
+        shlex.join(command),
+    ]
+    try:
+        result = subprocess.run(
+            docker_command,
+            cwd=root,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            env={"PATH": os.environ.get("PATH", "")},
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = (exc.stdout or "") + (exc.stderr or "")
+        return json.dumps(
+            {
+                "status": "failed",
+                "command": command,
+                "output": f"Sandbox tests timed out after 120 seconds\n{_truncate(output)}",
+            }
+        )
+    finally:
+        shutil.rmtree(sandbox_directory, ignore_errors=True)
+
+    output = _truncate((result.stdout or "") + (result.stderr or ""))
+    return json.dumps(
+        {
+            "status": "passed" if result.returncode == 0 else "failed",
+            "exit_code": result.returncode,
+            "command": command,
+            "output": output,
+        }
+    )
 
 
 def mini_edit_required_output() -> dict[str, Any]:
@@ -2070,6 +2151,12 @@ def final_test_status(workspace: RepoWorkspace) -> dict[str, Any]:
     return result
 
 
+def configure_git_auth(root: Path) -> None:
+    """Configure GitHub CLI as the push credential helper after validation."""
+    if os.environ.get("GH_TOKEN"):
+        _run_process(["gh", "auth", "setup-git"], cwd=root)
+
+
 def create_pr(root: Path, issue: dict[str, Any], branch: str, summary: str) -> str:
     validate_agent_changes(root)
     _run_process(["git", "add", "--all"], cwd=root)
@@ -2080,6 +2167,9 @@ def create_pr(root: Path, issue: dict[str, Any], branch: str, summary: str) -> s
     _run_process(
         ["git", "commit", "-m", f"Fix issue #{issue['number']}"], cwd=root
     )
+    # Checkout credentials are intentionally disabled. Configure push
+    # authentication only after tests and protected-path validation succeed.
+    configure_git_auth(root)
     _run_process(["git", "push", "--set-upstream", "origin", branch], cwd=root)
 
     body = (

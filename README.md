@@ -87,7 +87,7 @@ Only issues labeled `agent-approved` start an automatic run. The job also uses t
 
 Protect the `main` branch in **Settings → Rules → Rulesets** or **Settings → Branches**. Require pull requests, at least one approving review, the `CI / test` status check, and no direct pushes or force pushes. Keep automatic merging disabled for agent-created pull requests until a maintainer reviews the diff.
 
-The harness refuses agent edits to workflow, action, credential, and private-key paths. It runs tests with a minimal environment and refuses to create a pull request when tests are skipped. If an issue already has an open automated pull request, a rerun reports that pull request instead of creating a duplicate; a stale branch receives a retry suffix.
+The harness refuses agent edits to workflow, action, credential, and private-key paths. In GitHub Actions, set `AGENT_SANDBOX_TESTS=1` so model-triggered and final tests run in the networkless Docker sandbox instead of on the runner host. The sandbox is read-only except for the checkout and temporary directory, drops capabilities, runs as the checkout owner, and applies CPU, memory, and process limits. The workflow also disables checkout credential persistence and configures push authentication only after validation succeeds. If an issue already has an open automated pull request, a rerun reports that pull request instead of creating a duplicate; a stale branch receives a retry suffix.
 
 ## Optional mini-SWE-agent engine
 

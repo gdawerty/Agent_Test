@@ -201,6 +201,11 @@ class AgentTests(unittest.TestCase):
         docker_args = mini_docker_run_args(repository)
         self.assertIn("none", docker_args)
         self.assertIn("--cap-drop=ALL", docker_args)
+        self.assertIn("--read-only", docker_args)
+        self.assertIn("--pids-limit", docker_args)
+        self.assertIn("--cpus", docker_args)
+        self.assertIn("--memory", docker_args)
+        self.assertIn("--memory-swap", docker_args)
         if hasattr(os, "getuid") and hasattr(os, "getgid"):
             self.assertIn("--user", docker_args)
             user_index = docker_args.index("--user")
@@ -303,6 +308,16 @@ class AgentTests(unittest.TestCase):
                 (root / ".env").read_text(encoding="utf-8"),
                 "TEST_ONLY=placeholder\n",
             )
+
+    def test_sandboxed_tests_do_not_use_the_host_test_runner(self):
+        workspace = RepoWorkspace(Path(__file__).parent.parent)
+        with patch.dict(os.environ, {"AGENT_SANDBOX_TESTS": "1"}):
+            with patch(
+                "agent.run_tests_in_sandbox",
+                return_value='{"status":"passed"}',
+            ) as sandbox_tests:
+                self.assertEqual(workspace.run_tests(), '{"status":"passed"}')
+                sandbox_tests.assert_called_once_with(workspace.root)
 
     def test_mini_python_edit_is_synced_even_when_command_fails(self):
         with tempfile.TemporaryDirectory() as directory:

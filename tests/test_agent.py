@@ -15,8 +15,10 @@ from agent import (
     AgentRunner,
     GeminiModel,
     RepoWorkspace,
+    RunBudget,
     _prepare_mini_sandbox,
     _sync_mini_sandbox,
+    build_repository_index,
     find_open_issue_pr,
     final_test_status,
     has_worktree_changes,
@@ -71,6 +73,103 @@ class ScriptedModel:
 
 
 class AgentTests(unittest.TestCase):
+    def test_run_budget_is_shared_and_bounded(self):
+        budget = RunBudget(2)
+        budget.consume(phase="localization")
+        budget.consume(phase="repair")
+        self.assertEqual(budget.remaining, 0)
+        self.assertEqual(budget.calls_by_phase, {"localization": 1, "repair": 1})
+        with self.assertRaises(AgentError):
+            budget.consume(phase="repair")
+
+    def test_agent_runner_stops_when_shared_budget_is_exhausted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+            class ReadOnlyModel:
+                def __init__(self):
+                    self.calls = 0
+
+                def create(self, *, instructions, input_items, tools):
+                    self.calls += 1
+                    return FakeResponse(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": "read_file",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "app.py",
+                                        "start_line": 1,
+                                        "end_line": 1,
+                                    }
+                                ),
+                                "call_id": f"call-{self.calls}",
+                            }
+                        ]
+                    )
+
+            model = ReadOnlyModel()
+            budget = RunBudget(2)
+            with self.assertRaises(AgentError):
+                AgentRunner(
+                    RepoWorkspace(root),
+                    model,
+                    max_steps=15,
+                    budget=budget,
+                    log=lambda _: None,
+                ).run({"number": 13, "title": "Fix value", "body": "Fix it."})
+            self.assertEqual(model.calls, 2)
+            self.assertEqual(budget.model_calls_used, 2)
+
+    def test_repository_index_maps_symbols_and_excludes_secrets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text(
+                "VALUE = 'bug'\n\n"
+                "def fix_value(value):\n"
+                "    return value\n",
+                encoding="utf-8",
+            )
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_app.py").write_text(
+                "class AppTest:\n"
+                "    def test_value(self):\n"
+                "        pass\n",
+                encoding="utf-8",
+            )
+            (root / ".env").write_text("SECRET=do-not-index\n", encoding="utf-8")
+
+            index = build_repository_index(root)
+            rendered = index.render("Fix the value")
+
+            self.assertIs(build_repository_index(root), index)
+            self.assertIn("app.py", rendered)
+            self.assertIn("fix_value", rendered)
+            self.assertIn("test_value", rendered)
+            self.assertIn("VALUE", rendered)
+            self.assertNotIn(".env", rendered)
+            self.assertNotIn("do-not-index", rendered)
+
     def test_verbose_flag(self):
         from agent import build_parser
         parser = build_parser()
@@ -275,6 +374,181 @@ class AgentTests(unittest.TestCase):
             )
             self.assertEqual(
                 model.available_tools[6], {"read_file", "edit_file"}
+            )
+            self.assertEqual(
+                (root / "app.py").read_text(encoding="utf-8"),
+                "VALUE = 'fixed'\n",
+            )
+
+    def test_implementation_phase_requires_edit_after_targeted_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+            class PhaseModel:
+                def __init__(self):
+                    self.calls = 0
+                    self.tools_by_call = []
+                    self.choices = []
+                    self.input_lengths = []
+
+                def create(
+                    self, *, instructions, input_items, tools, tool_choice=None
+                ):
+                    self.calls += 1
+                    self.tools_by_call.append({tool["name"] for tool in tools})
+                    self.choices.append(tool_choice)
+                    self.input_lengths.append(len(input_items))
+                    if self.calls <= 8:
+                        name = "read_file"
+                        arguments = {
+                            "path": "app.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                        }
+                    elif self.calls == 9:
+                        name = "edit_file"
+                        arguments = {
+                            "path": "app.py",
+                            "old_text": "VALUE = 'bug'\n",
+                            "new_text": "VALUE = 'fixed'\n",
+                        }
+                    else:
+                        return FakeResponse(output_text="Fixed the value.")
+                    return FakeResponse(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": json.dumps(arguments),
+                                "call_id": f"call-{self.calls}",
+                            }
+                        ]
+                    )
+
+            model = PhaseModel()
+            result = AgentRunner(
+                RepoWorkspace(root), model, max_steps=10, log=lambda _: None
+            ).run({"number": 10, "title": "Fix value", "body": "Fix it."})
+
+            self.assertEqual(result.steps, 10)
+            self.assertEqual(model.tools_by_call[7], {"read_file", "edit_file"})
+            self.assertEqual(model.tools_by_call[8], {"edit_file"})
+            self.assertIsNone(model.choices[7])
+            self.assertEqual(model.input_lengths[8], 1)
+            self.assertEqual(
+                model.choices[8],
+                {"type": "function", "function": {"name": "edit_file"}},
+            )
+            self.assertEqual(
+                (root / "app.py").read_text(encoding="utf-8"),
+                "VALUE = 'fixed'\n",
+            )
+
+    def test_failed_edit_allows_one_recovery_read_then_requires_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+
+            class RecoveryModel:
+                def __init__(self):
+                    self.calls = 0
+                    self.tools_by_call = []
+                    self.choices = []
+
+                def create(
+                    self, *, instructions, input_items, tools, tool_choice=None
+                ):
+                    self.calls += 1
+                    self.tools_by_call.append({tool["name"] for tool in tools})
+                    self.choices.append(tool_choice)
+                    if self.calls <= 8:
+                        name = "read_file"
+                        arguments = {
+                            "path": "app.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                        }
+                    elif self.calls == 9:
+                        name = "edit_file"
+                        arguments = {
+                            "path": "app.py",
+                            "old_text": "VALUE = 'stale'\n",
+                            "new_text": "VALUE = 'fixed'\n",
+                        }
+                    elif self.calls == 10:
+                        name = "read_file"
+                        arguments = {
+                            "path": "app.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                        }
+                    elif self.calls == 11:
+                        name = "edit_file"
+                        arguments = {
+                            "path": "app.py",
+                            "old_text": "VALUE = 'bug'\n",
+                            "new_text": "VALUE = 'fixed'\n",
+                        }
+                    else:
+                        return FakeResponse(output_text="Fixed the value.")
+                    return FakeResponse(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": name,
+                                "arguments": json.dumps(arguments),
+                                "call_id": f"call-{self.calls}",
+                            }
+                        ]
+                    )
+
+            model = RecoveryModel()
+            result = AgentRunner(
+                RepoWorkspace(root), model, max_steps=12, log=lambda _: None
+            ).run({"number": 11, "title": "Fix value", "body": "Fix it."})
+
+            self.assertEqual(result.steps, 12)
+            self.assertEqual(model.tools_by_call[9], {"read_file", "edit_file"})
+            self.assertEqual(model.tools_by_call[10], {"edit_file"})
+            self.assertIsNone(model.choices[9])
+            self.assertEqual(
+                model.choices[10],
+                {"type": "function", "function": {"name": "edit_file"}},
             )
             self.assertEqual(
                 (root / "app.py").read_text(encoding="utf-8"),

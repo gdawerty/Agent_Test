@@ -16,7 +16,7 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: agent-fix-gemini
+  group: agent-fix-${{ github.workflow }}-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number || github.run_id }}
   queue: max
 
 jobs:

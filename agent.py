@@ -9,6 +9,7 @@ commit, push, or open a pull request by itself.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol, Sequence
@@ -34,6 +35,9 @@ MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 15
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
+CUSTOM_IMPLEMENTATION_CALL = 9
+REPOSITORY_INDEX_VERSION = 1
+MAX_INDEX_SYMBOLS = 250
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
 MINI_EDIT_DEADLINE_CALL = 7
@@ -96,6 +100,207 @@ class AgentError(RuntimeError):
 
 class MiniEditDeadlineExceeded(RuntimeError):
     """The mini engine stalled after its investigation checkpoint without editing."""
+
+
+@dataclass
+class RunBudget:
+    """One model-call budget shared by every phase and engine in a run."""
+
+    max_model_calls: int
+    model_calls_used: int = 0
+    calls_by_phase: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_model_calls - self.model_calls_used)
+
+    def consume(self, count: int = 1, *, phase: str) -> None:
+        if count < 0:
+            raise ValueError("count must not be negative")
+        if self.model_calls_used + count > self.max_model_calls:
+            raise AgentError(
+                f"Global model-call budget exhausted before {phase} could continue "
+                f"({self.model_calls_used}/{self.max_model_calls} calls used)."
+            )
+        self.model_calls_used += count
+        self.calls_by_phase[phase] = self.calls_by_phase.get(phase, 0) + count
+
+
+@dataclass(frozen=True)
+class RepositorySymbol:
+    path: str
+    name: str
+    kind: str
+    start_line: int
+    end_line: int
+    signature: str
+
+
+@dataclass(frozen=True)
+class RepositoryIndex:
+    """Compact, deterministic repository structure used before model exploration."""
+
+    revision: str
+    files: tuple[str, ...]
+    symbols: tuple[RepositorySymbol, ...]
+
+    def render(self, issue_text: str = "", limit: int = MAX_TOOL_OUTPUT) -> str:
+        terms = {
+            term.lower()
+            for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", issue_text)
+        }
+
+        def score(symbol: RepositorySymbol) -> tuple[int, str, int]:
+            path = symbol.path.lower()
+            name = symbol.name.lower()
+            score_value = 0
+            for term in terms:
+                if term == name:
+                    score_value += 8
+                elif term in name:
+                    score_value += 4
+                elif term in path:
+                    score_value += 2
+            if "test" in path or symbol.kind == "test":
+                score_value += 1
+            return (-score_value, symbol.path, symbol.start_line)
+
+        ranked_symbols = sorted(self.symbols, key=score)[:MAX_INDEX_SYMBOLS]
+        lines = [
+            f"Repository map for revision {self.revision}.",
+            "The map is generated before the agent starts; use it to target reads.",
+            "",
+            "Files:",
+            *(f"- {path}" for path in self.files[:1000]),
+            "",
+            "Python symbols (path:line-end kind name signature):",
+        ]
+        lines.extend(
+            f"- {symbol.path}:{symbol.start_line}-{symbol.end_line} "
+            f"{symbol.kind} {symbol.name} {symbol.signature}"
+            for symbol in ranked_symbols
+        )
+        if not self.symbols:
+            lines.append("(no Python symbols indexed)")
+        return _truncate("\n".join(lines), limit)
+
+
+_REPOSITORY_INDEX_CACHE: dict[tuple[str, str, int], RepositoryIndex] = {}
+
+
+def _repository_revision(root: Path) -> str:
+    revision = _run_process(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=False
+    ).strip()
+    return revision if re.fullmatch(r"[0-9a-f]{7,40}", revision) else "working-tree"
+
+
+def _index_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in IGNORED_DIRECTORIES for part in relative.parts):
+            continue
+        if _is_secret_path(relative):
+            continue
+        files.append(path)
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _python_symbols(root: Path, path: Path) -> list[RepositorySymbol]:
+    relative = path.relative_to(root).as_posix()
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=relative)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+
+    symbols: list[RepositorySymbol] = []
+
+    def visit(nodes: list[ast.AST], parent: str | None = None) -> None:
+        for node in nodes:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets: list[ast.AST] = []
+                if isinstance(node, ast.Assign):
+                    targets.extend(node.targets)
+                else:
+                    targets.append(node.target)
+                for target in targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    if parent is None and not target.id.isupper():
+                        continue
+                    name = f"{parent}.{target.id}" if parent else target.id
+                    symbols.append(
+                        RepositorySymbol(
+                            relative,
+                            name,
+                            "constant" if parent is None else "attribute",
+                            node.lineno,
+                            getattr(node, "end_lineno", node.lineno),
+                            name,
+                        )
+                    )
+            elif isinstance(node, ast.ClassDef):
+                name = f"{parent}.{node.name}" if parent else node.name
+                symbols.append(
+                    RepositorySymbol(
+                        relative,
+                        name,
+                        "class",
+                        node.lineno,
+                        getattr(node, "end_lineno", node.lineno),
+                        f"class {node.name}",
+                    )
+                )
+                visit(node.body, name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = f"{parent}.{node.name}" if parent else node.name
+                try:
+                    arguments = ast.unparse(node.args)
+                except Exception:
+                    arguments = "(...)"
+                kind = "method" if parent else "function"
+                if name.startswith("test") or ".test_" in name:
+                    kind = "test"
+                prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                symbols.append(
+                    RepositorySymbol(
+                        relative,
+                        name,
+                        kind,
+                        node.lineno,
+                        getattr(node, "end_lineno", node.lineno),
+                        f"{prefix} {node.name}({arguments})",
+                    )
+                )
+                # Nested functions are implementation details; their parent is
+                # enough for the first-pass map and keeps the context compact.
+
+    visit(tree.body)
+    return symbols
+
+
+def build_repository_index(root: Path) -> RepositoryIndex:
+    """Build or reuse a structural map for the checked-out revision."""
+    root = root.resolve()
+    revision = _repository_revision(root)
+    key = (str(root), revision, REPOSITORY_INDEX_VERSION)
+    cached = _REPOSITORY_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    paths = _index_files(root)
+    files = tuple(path.relative_to(root).as_posix() for path in paths)
+    symbols: list[RepositorySymbol] = []
+    for path in paths:
+        if path.suffix.lower() in {".py", ".pyi"}:
+            symbols.extend(_python_symbols(root, path))
+    index = RepositoryIndex(revision, files, tuple(symbols))
+    _REPOSITORY_INDEX_CACHE[key] = index
+    return index
 
 
 def _truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
@@ -555,7 +760,7 @@ TOOLS: list[dict[str, Any]] = [
 SYSTEM_PROMPT = """
 You are a careful software engineering agent fixing one GitHub issue.
 
-You have a small number of tool turns, so work quickly and reserve enough turns to
+You have a small number of model calls, so work quickly and reserve enough calls to
 edit, test, and finish:
 1. Use search_code to locate the relevant symbol or behavior. Search uses literal text
    and returns line numbers with nearby context.
@@ -575,11 +780,11 @@ edit, test, and finish:
    unrelated code.
 
 Execution constraints:
-- You should normally make the first edit within 4-5 model turns.
+- You should normally make the first edit within 4-5 model calls.
 - Do not repeatedly search for code you have already located.
 - Do not inspect unrelated initialization or entrypoint code unless required.
 - Do not search broadly for tests when the repository already contains an obvious test file.
-- Reserve at least two turns after the first edit for testing and finalizing.
+- Reserve at least two calls after the first edit for testing and finalizing.
 - When changing a CLI, API, parser, or validation path, inspect downstream callers and
   update relevant tests before declaring the change complete. Declare each argument
   exactly once, and test both the new invocation and the existing normal invocation.
@@ -595,7 +800,14 @@ Rules:
 
 
 class Model(Protocol):
-    def create(self, *, instructions: str, input_items: list[Any], tools: list[dict[str, Any]]) -> Any:
+    def create(
+        self,
+        *,
+        instructions: str,
+        input_items: list[Any],
+        tools: list[dict[str, Any]],
+        tool_choice: Any | None = None,
+    ) -> Any:
         ...
 
 
@@ -610,13 +822,26 @@ class OpenAIModel:
         self.model = model
         self.client = OpenAI()
 
-    def create(self, *, instructions: str, input_items: list[Any], tools: list[dict[str, Any]]) -> Any:
-        return self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=input_items,
-            tools=tools,
-        )
+    def create(
+        self,
+        *,
+        instructions: str,
+        input_items: list[Any],
+        tools: list[dict[str, Any]],
+        tool_choice: Any | None = None,
+    ) -> Any:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "instructions": instructions,
+            "input": input_items,
+            "tools": tools,
+        }
+        if tool_choice is not None:
+            request["tool_choice"] = {
+                "type": "function",
+                "name": tool_choice["function"]["name"],
+            }
+        return self.client.responses.create(**request)
 
 
 class GeminiModel:
@@ -692,13 +917,15 @@ class GeminiModel:
         instructions: str,
         input_items: list[Any],
         tools: list[dict[str, Any]],
+        tool_choice: Any | None = None,
     ) -> Any:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=self._messages(instructions, input_items),
-            tools=self._chat_tools(tools),
-            tool_choice="auto",
-        )
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._messages(instructions, input_items),
+            "tools": self._chat_tools(tools),
+            "tool_choice": "auto" if tool_choice is None else tool_choice,
+        }
+        response = self.client.chat.completions.create(**request)
         if not response.choices:
             raise AgentError("Gemini returned no completion choices")
 
@@ -919,6 +1146,7 @@ def run_mini_agent(
     provider: str,
     model: str,
     max_steps: int,
+    budget: RunBudget | None = None,
     log: Callable[[str], None] = print,
 ) -> AgentResult:
     """Run mini-SWE-agent as an optional, Docker-isolated inner agent.
@@ -926,6 +1154,10 @@ def run_mini_agent(
     The outer harness still owns branch creation, validation, testing, commits,
     pushes, and pull requests. The mini agent only edits a temporary checkout copy.
     """
+    if budget is not None:
+        max_steps = min(max_steps, budget.remaining)
+    if max_steps <= 0:
+        raise AgentError("No model-call budget remains for the mini engine.")
     if shutil.which("docker") is None:
         raise AgentError(
             "The mini engine requires Docker. Install Docker and build the sandbox "
@@ -1062,8 +1294,9 @@ You can execute bash commands and edit files to implement the necessary changes.
 
 ## Required workflow
 
-1. Inspect only the files relevant to the issue.
-2. Make the smallest reasonable implementation edit by model call 7.
+1. Use the repository map and inspect only files relevant to the issue.
+2. Make the smallest reasonable implementation edit after you have enough evidence;
+   do not spend the whole budget rereading the same code.
 3. Run the repository tests after editing and fix failures caused by your change.
 4. Stop exploring once the issue is fixed and the tests pass.
 5. Finish with exactly one bash tool call whose command is:
@@ -1086,6 +1319,8 @@ spend the whole budget reading files: after the relevant code is located, edit i
         f"GitHub issue #{issue['number']}\n"
         f"Title: {issue.get('title', '')}\n\n"
         f"Description:\n{issue.get('body') or '(no issue description)'}\n\n"
+        "Repository map:\n"
+        f"{build_repository_index(root).render(issue.get('title', '') + ' ' + (issue.get('body') or ''))}\n\n"
         "Make the implementation change in the current checkout, verify it with tests, "
         "and then submit the final summary command."
     )
@@ -1126,6 +1361,9 @@ spend the whole budget reading files: after the relevant code is located, edit i
     finally:
         shutil.rmtree(trajectory_directory, ignore_errors=True)
         shutil.rmtree(sandbox_directory, ignore_errors=True)
+
+    if budget is not None:
+        budget.consume(agent.n_calls, phase="mini")
 
     if run_error is not None:
         raise AgentError(f"mini-SWE-agent failed: {run_error}") from run_error
@@ -1168,12 +1406,14 @@ class AgentRunner:
         model: Model,
         *,
         max_steps: int = MAX_STEPS,
+        budget: RunBudget | None = None,
         request_delay: float = 0.0,
         log: Callable[[str], None] = print,
     ):
         self.workspace = workspace
         self.model = model
         self.max_steps = max_steps
+        self.budget = budget
         self.request_delay = max(0.0, request_delay)
         self.log = log
 
@@ -1220,23 +1460,33 @@ class AgentRunner:
         issue_number = issue["number"]
         title = issue.get("title", "")
         body = issue.get("body") or "(no issue description)"
-        repository_files = _truncate(self.workspace.list_files(), MAX_TOOL_OUTPUT)
+        repository_map = build_repository_index(self.workspace.root).render(
+            f"{title} {body}"
+        )
+        initial_prompt = (
+            f"GitHub issue #{issue_number}\n"
+            f"Title: {title}\n\n"
+            f"Description:\n{body}\n\n"
+            f"Repository map:\n{repository_map}\n\n"
+            "Fix this issue in the current repository."
+        )
         input_items: list[Any] = [
             {
                 "role": "user",
-                "content": (
-                    f"GitHub issue #{issue_number}\n"
-                    f"Title: {title}\n\n"
-                    f"Description:\n{body}\n\n"
-                    f"Repository files:\n{repository_files}\n\n"
-                    "Fix this issue in the current repository."
-                ),
+                "content": initial_prompt,
             }
         ]
         search_calls = 0
         edit_made = False
+        recovery_turn = False
+        observations: list[str] = []
+        implementation_context_compacted = False
 
-        for step in range(1, self.max_steps + 1):
+        step_limit = self.max_steps
+        if self.budget is not None:
+            step_limit = min(step_limit, self.budget.remaining)
+
+        for step in range(1, step_limit + 1):
             self.log(f"\n--- Agent step {step} ---")
             if step > 1 and self.request_delay:
                 time.sleep(self.request_delay)
@@ -1252,13 +1502,50 @@ class AgentRunner:
                 allowed_tools = [
                     tool for tool in TOOLS if tool["name"] != "search_code"
                 ]
-            if step >= 6 and not edit_made:
+            implementation_phase = (
+                not edit_made and step >= CUSTOM_IMPLEMENTATION_CALL
+            )
+            if not edit_made and recovery_turn:
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] in {"read_file", "edit_file"}
+                ]
+            elif not edit_made and implementation_phase:
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] == "edit_file"
+                ]
+            elif step >= 6 and not edit_made:
                 allowed_tools = [
                     tool
                     for tool in allowed_tools
                     if tool["name"] in {"read_file", "edit_file"}
                 ]
             allowed_tool_names = {tool["name"] for tool in allowed_tools}
+            force_edit = implementation_phase and not recovery_turn
+            tool_choice = (
+                {
+                    "type": "function",
+                    "function": {"name": "edit_file"},
+                }
+                if force_edit
+                else None
+            )
+
+            if implementation_phase and not recovery_turn and not implementation_context_compacted:
+                evidence = _truncate(
+                    "\n\n".join(observations), MAX_TOOL_OUTPUT
+                )
+                input_items = [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{initial_prompt}\n\n"
+                            "Relevant evidence collected during localization:\n"
+                            f"{evidence or '(No successful read was collected; use the map.)'}\n\n"
+                            "The implementation phase has started. Apply the smallest correct edit."
+                        ),
+                    }
+                ]
+                implementation_context_compacted = True
 
             remaining = self.max_steps - step + 1
             turn_instructions = (
@@ -1274,14 +1561,20 @@ class AgentRunner:
                 )
             if step >= 6 and not edit_made:
                 turn_instructions += (
-                    "You must make an edit now unless you are genuinely blocked. "
-                    "Only read_file and edit_file are available in this phase.\n"
+                    "The implementation checkpoint is approaching. Targeted reads "
+                    "are allowed, but do not repeat exploration; edit as soon as "
+                    "you have enough context.\n"
                 )
-            if step >= 7 and not edit_made:
+            if force_edit:
                 turn_instructions += (
-                    "You are at the implementation checkpoint. A targeted read_file "
-                    "call remains available if necessary, but do not repeat exploration. "
-                    "Edit as soon as you have enough context.\n"
+                    "You have enough repository context to implement the fix. "
+                    "Call edit_file now. Do not call a read or search tool.\n"
+                )
+            elif recovery_turn:
+                turn_instructions += (
+                    "The previous edit attempt did not apply. You may make one "
+                    "targeted read_file call to correct the exact replacement, "
+                    "then call edit_file. Do not resume general exploration.\n"
                 )
             if remaining <= 3:
                 turn_instructions += (
@@ -1291,11 +1584,16 @@ class AgentRunner:
 
             for attempt in range(2):
                 try:
-                    response = self.model.create(
-                        instructions=turn_instructions,
-                        input_items=input_items,
-                        tools=allowed_tools,
-                    )
+                    if self.budget is not None:
+                        self.budget.consume(phase="custom")
+                    request: dict[str, Any] = {
+                        "instructions": turn_instructions,
+                        "input_items": input_items,
+                        "tools": allowed_tools,
+                    }
+                    if tool_choice is not None:
+                        request["tool_choice"] = tool_choice
+                    response = self.model.create(**request)
                     break
                 except Exception as exc:
                     retry_delay = _rate_limit_delay(exc)
@@ -1312,9 +1610,34 @@ class AgentRunner:
                 item for item in output_items if _item_value(item, "type") == "function_call"
             ]
             if not tool_calls:
+                if force_edit:
+                    recovery_turn = True
+                    input_items.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The implementation is not complete. Use the available "
+                                "edit_file tool on your next turn."
+                            ),
+                        }
+                    )
+                    continue
+                if recovery_turn:
+                    recovery_turn = False
+                    input_items.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Do not finish without applying the fix. Call edit_file "
+                                "on your next turn."
+                            ),
+                        }
+                    )
+                    continue
                 final_message = _item_value(response, "output_text", "") or "Agent finished without a summary."
                 return AgentResult(str(final_message), step)
 
+            edit_succeeded = False
             for call in tool_calls:
                 name = _item_value(call, "name")
                 raw_arguments = _item_value(call, "arguments", "{}")
@@ -1339,6 +1662,11 @@ class AgentRunner:
                         ("Successfully edited", "Successfully created")
                     ):
                         edit_made = True
+                        edit_succeeded = True
+                    elif name in {"search_code", "read_file"} and not result.startswith(
+                        ("ERROR:", "TOOL ERROR:")
+                    ):
+                        observations.append(f"{name}:\n{_truncate(result, 4_000)}")
                 self.log(_truncate(result, 1_000))
                 input_items.append(
                     {
@@ -1347,6 +1675,16 @@ class AgentRunner:
                         "output": result,
                     }
                 )
+
+            if edit_succeeded:
+                recovery_turn = False
+            elif force_edit:
+                # A rejected or malformed forced edit gets one recovery turn. This
+                # permits a precise read without reopening unrestricted exploration.
+                recovery_turn = True
+            elif recovery_turn:
+                # The recovery turn is single-use; the next turn must attempt an edit.
+                recovery_turn = False
 
         if self._has_worktree_changes():
             message = (
@@ -1607,6 +1945,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_steps <= 0:
         raise AgentError("max_steps must be positive")
 
+    budget = RunBudget(args.max_steps)
+
     root = repository_root(Path.cwd())
     require_clean_worktree(root)
     issue = get_issue(root, args.issue_number)
@@ -1629,17 +1969,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             issue,
             provider=args.provider,
             model=args.model,
-            max_steps=args.max_steps,
+            max_steps=budget.remaining,
+            budget=budget,
         )
         if not has_worktree_changes(root):
+            if budget.remaining <= 0:
+                raise AgentError(
+                    "The global model-call budget was exhausted without an edit; "
+                    "no pull request was created."
+                )
             print(
-                "\nMini agent made no edit. Retrying with the focused tool agent "
-                "so this issue does not consume the remaining mini steps."
+                f"\nMini agent made no edit. Retrying with the focused tool agent "
+                f"using the {budget.remaining} remaining model calls."
             )
             runner = AgentRunner(
                 workspace,
                 create_model(args.provider, args.model),
-                max_steps=args.max_steps,
+                max_steps=budget.remaining,
+                budget=budget,
                 request_delay=(
                     float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
                     if args.provider == "gemini"
@@ -1652,6 +1999,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             workspace,
             create_model(args.provider, args.model),
             max_steps=args.max_steps,
+            budget=budget,
             request_delay=(
                 float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
                 if args.provider == "gemini"

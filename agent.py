@@ -2040,6 +2040,45 @@ def _changed_paths(root: Path) -> set[str]:
     return paths
 
 
+def change_metrics(root: Path) -> tuple[set[str], int, int]:
+    paths = _changed_paths(root)
+    diff = _run_process(
+        ["git", "diff", "--no-ext-diff", "--no-color", "--unified=0", "HEAD", "--"],
+        cwd=root,
+        check=False,
+    )
+    added = removed = 0
+    for line in diff.splitlines():
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    # Untracked files are absent from git diff; count their contents as additions.
+    untracked = _run_process(
+        ["git", "ls-files", "--others", "--exclude-standard"], cwd=root, check=False
+    ).splitlines()
+    for name in untracked:
+        path = root / name
+        if path.is_file():
+            try:
+                added += len(path.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError:
+                pass
+    return paths, added, removed
+
+
+def validate_change_limits(root: Path, max_diff_lines: int, max_changed_files: int) -> tuple[set[str], int, int]:
+    paths, added, removed = change_metrics(root)
+    total = added + removed
+    if total > max_diff_lines:
+        raise AgentError(f"Maximum diff lines exceeded: limit {max_diff_lines}, actual {total}.")
+    if len(paths) > max_changed_files:
+        raise AgentError(f"Maximum changed files exceeded: limit {max_changed_files}, actual {len(paths)}.")
+    return paths, added, removed
+
+
 def validate_agent_changes(root: Path) -> None:
     protected = sorted(
         path for path in _changed_paths(root) if _is_protected_path(Path(path))
@@ -2223,6 +2262,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["custom", "mini"],
         help="Agent engine (default: $AGENT_ENGINE or custom)",
     )
+    parser.add_argument("--max-diff-lines", type=int, default=200, help="Maximum added and removed diff lines (default: 200)")
+    parser.add_argument("--max-changed-files", type=int, default=25, help="Maximum changed file paths (default: 25)")
     parser.add_argument(
         "--max-steps",
         type=int,
@@ -2371,10 +2412,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("\nAgent finished:")
     print(result.final_message)
     validate_agent_changes(root)
+    paths, added, removed = validate_change_limits(root, args.max_diff_lines, args.max_changed_files)
     test_result = final_test_status(workspace)
     print(f"\nFinal tests: {json.dumps(test_result)}")
 
     if args.dry_run:
+        print(f"\nChange summary: {len(paths)} files; {added} added lines; {removed} removed lines; {added + removed} total changed lines. Limits: {args.max_diff_lines} lines, {args.max_changed_files} files.")
         status = _run_process(
             ["git", "status", "--short", "--untracked-files=all"], cwd=root, check=False
         ).strip()

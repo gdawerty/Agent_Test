@@ -55,10 +55,10 @@ Create a small issue in the target repository, for example one describing a fail
 
 ```bash
 git status --short
-python agent.py 12 --dry-run
+python agent.py 12 --dry-run --max-diff-lines 200 --max-changed-files 25
 ```
 
-Dry-run still fetches the issue and calls the model, and it can edit the checkout. It does not create a branch, commit, push, or pull request. Review the printed diff, then restore the disposable clone before trying again.
+The change-safety limits default to 200 added/removed lines and 25 changed files; override them with `--max-diff-lines N` and `--max-changed-files N`. Dry-run prints a change summary and still fetches the issue and calls the model, and it can edit the checkout. It does not create a branch, commit, push, or pull request. Review the printed diff, then restore the disposable clone before trying again.
 
 For the full issue-to-PR flow:
 

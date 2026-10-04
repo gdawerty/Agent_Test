@@ -109,4 +109,6 @@ python agent.py 12 --engine mini --max-steps 12 --dry-run
 
 The Docker container has no network, receives no `GH_TOKEN`, `GITHUB_TOKEN`, `GEMINI_API_KEY`, or `OPENAI_API_KEY`, and mounts a temporary copy at `/workspace`. The copy excludes `.git`, ignored virtualenv/build directories, and credential-looking files; safe changes are synchronized back after the run. The outer process still rejects protected-file changes and requires a passing final test run before creating a PR. This is an experimental containment boundary, not a complete security sandbox.
 
+The mini engine allows investigation through its checkpoint, then rejects non-edit bash commands until it detects a file change. This prevents repeated test, search, and inspection commands from consuming the remaining calls without attempting an implementation.
+
 To try it through GitHub Actions after the local dry run works, add a repository variable named `AGENT_ENGINE` with the value `mini`. The existing `agent-approved` label and environment reviewer gates still apply. Delete the variable or set it to `custom` to return to the current engine.

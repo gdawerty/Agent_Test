@@ -1069,6 +1069,17 @@ def mini_command_makes_edit(command: str) -> bool:
     return any(re.search(pattern, command, re.IGNORECASE | re.DOTALL) for pattern in patterns)
 
 
+def mini_command_allowed(
+    command: str, *, calls: int, edit_made: bool
+) -> bool:
+    """Allow only implementation commands after the mini edit checkpoint."""
+    return (
+        edit_made
+        or calls < MINI_EDIT_DEADLINE_CALL
+        or mini_command_makes_edit(command)
+    )
+
+
 def _mini_changed_paths(
     before: dict[str, bytes], after: dict[str, bytes]
 ) -> set[str]:
@@ -1236,7 +1247,7 @@ def run_mini_agent(
         ) from exc
 
     class FocusedMiniAgent(DefaultAgent):
-        """Bound unproductive exploration without forbidding targeted reads."""
+        """Bound exploration and require an edit after the implementation checkpoint."""
 
         def __init__(self, *args: Any, **kwargs: Any):
             self.edit_made = False
@@ -1247,9 +1258,9 @@ def run_mini_agent(
             if not self.edit_made and self.n_calls >= MINI_EDIT_DEADLINE_CALL - 1:
                 if self.n_calls >= MINI_EDIT_DEADLINE_CALL:
                     message = (
-                        "Implementation checkpoint reached. A targeted read is still allowed "
-                        "if needed, but do not repeat exploration. Make the smallest edit "
-                        "as soon as you have enough context."
+                        "Implementation checkpoint reached. The next bash command must modify "
+                        "a repository file. Do not run tests, inspect files, use git, or "
+                        "repeat exploration until an edit has been made."
                     )
                 else:
                     message = (
@@ -1264,6 +1275,23 @@ def run_mini_agent(
             for action in message.get("extra", {}).get("actions", []):
                 command = str(action.get("command", ""))
                 log(f"Mini step {self.n_calls}: bash {_truncate(command, 500)}")
+                if not mini_command_allowed(
+                    command, calls=self.n_calls, edit_made=self.edit_made
+                ):
+                    output = {
+                        "returncode": 2,
+                        "output": (
+                            "EDIT_REQUIRED: the implementation checkpoint has been "
+                            "reached. Use a bash command that modifies a repository file "
+                            "before reading, testing, or finishing."
+                        ),
+                    }
+                    outputs.append(output)
+                    log(
+                        "Mini result: exit=2 edit_detected=False command_rejected=True\n"
+                        f"{_mini_action_output(output)}"
+                    )
+                    continue
                 action_before = _mini_snapshot(sandbox_root)
                 output = self.env.execute(action)
                 action_after = _mini_snapshot(sandbox_root)

@@ -9,6 +9,7 @@ commit, push, or open a pull request by itself.
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -18,7 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Protocol, Sequence
@@ -31,12 +32,22 @@ DEFAULT_ENGINE = "custom"
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
-MAX_STEPS = 15
+MAX_STEPS = 12
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
+PHASE_BUDGETS = {
+    "investigate": 4,
+    "implement": 3,
+    "repair": 3,
+    "verify": 2,
+}
+REPOSITORY_INDEX_VERSION = 1
+MAX_INDEX_SYMBOLS = 250
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
-MINI_EDIT_DEADLINE_CALL = 7
+MINI_MAX_CALLS = 6
+MINI_EDIT_DEADLINE_CALL = 4
+MINI_STALL_CALLS = 3
 TEST_ENV_ALLOWLIST = {
     "CI",
     "HOME",
@@ -94,7 +105,224 @@ class AgentError(RuntimeError):
 
 
 class MiniEditDeadlineExceeded(RuntimeError):
-    """The mini engine exhausted its investigation window without editing."""
+    """The mini engine stalled after its investigation checkpoint without editing."""
+
+
+@dataclass
+class RunBudget:
+    """One model-call budget shared by every phase and engine in a run."""
+
+    max_model_calls: int
+    model_calls_used: int = 0
+    calls_by_phase: dict[str, int] = field(default_factory=dict)
+    phase_limits: dict[str, int] = field(
+        default_factory=lambda: dict(PHASE_BUDGETS)
+    )
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.max_model_calls - self.model_calls_used)
+
+    def phase_remaining(self, phase: str) -> int:
+        limit = self.phase_limits.get(phase)
+        if limit is None:
+            return self.remaining
+        return max(0, limit - self.calls_by_phase.get(phase, 0))
+
+    def consume(self, count: int = 1, *, phase: str) -> None:
+        if count < 0:
+            raise ValueError("count must not be negative")
+        phase_limit = self.phase_limits.get(phase)
+        phase_used = self.calls_by_phase.get(phase, 0)
+        if phase_limit is not None and phase_used + count > phase_limit:
+            raise AgentError(
+                f"{phase} phase budget exhausted "
+                f"({phase_used}/{phase_limit} calls used)."
+            )
+        if self.model_calls_used + count > self.max_model_calls:
+            raise AgentError(
+                f"Global model-call budget exhausted before {phase} could continue "
+                f"({self.model_calls_used}/{self.max_model_calls} calls used)."
+            )
+        self.model_calls_used += count
+        self.calls_by_phase[phase] = self.calls_by_phase.get(phase, 0) + count
+
+
+@dataclass(frozen=True)
+class RepositorySymbol:
+    path: str
+    name: str
+    kind: str
+    start_line: int
+    end_line: int
+    signature: str
+
+
+@dataclass(frozen=True)
+class RepositoryIndex:
+    """Compact, deterministic repository structure used before model exploration."""
+
+    revision: str
+    files: tuple[str, ...]
+    symbols: tuple[RepositorySymbol, ...]
+
+    def render(self, issue_text: str = "", limit: int = MAX_TOOL_OUTPUT) -> str:
+        terms = {
+            term.lower()
+            for term in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", issue_text)
+        }
+
+        def score(symbol: RepositorySymbol) -> tuple[int, str, int]:
+            path = symbol.path.lower()
+            name = symbol.name.lower()
+            score_value = 0
+            for term in terms:
+                if term == name:
+                    score_value += 8
+                elif term in name:
+                    score_value += 4
+                elif term in path:
+                    score_value += 2
+            if "test" in path or symbol.kind == "test":
+                score_value += 1
+            return (-score_value, symbol.path, symbol.start_line)
+
+        ranked_symbols = sorted(self.symbols, key=score)[:MAX_INDEX_SYMBOLS]
+        lines = [
+            f"Repository map for revision {self.revision}.",
+            "The map is generated before the agent starts; use it to target reads.",
+            "",
+            "Files:",
+            *(f"- {path}" for path in self.files[:1000]),
+            "",
+            "Python symbols (path:line-end kind name signature):",
+        ]
+        lines.extend(
+            f"- {symbol.path}:{symbol.start_line}-{symbol.end_line} "
+            f"{symbol.kind} {symbol.name} {symbol.signature}"
+            for symbol in ranked_symbols
+        )
+        if not self.symbols:
+            lines.append("(no Python symbols indexed)")
+        return _truncate("\n".join(lines), limit)
+
+
+_REPOSITORY_INDEX_CACHE: dict[tuple[str, str, int], RepositoryIndex] = {}
+
+
+def _repository_revision(root: Path) -> str:
+    revision = _run_process(
+        ["git", "rev-parse", "HEAD"], cwd=root, check=False
+    ).strip()
+    return revision if re.fullmatch(r"[0-9a-f]{7,40}", revision) else "working-tree"
+
+
+def _index_files(root: Path) -> list[Path]:
+    files: list[Path] = []
+    for path in root.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(root)
+        if any(part in IGNORED_DIRECTORIES for part in relative.parts):
+            continue
+        if _is_secret_path(relative):
+            continue
+        files.append(path)
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _python_symbols(root: Path, path: Path) -> list[RepositorySymbol]:
+    relative = path.relative_to(root).as_posix()
+    try:
+        source = path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=relative)
+    except (OSError, UnicodeDecodeError, SyntaxError):
+        return []
+
+    symbols: list[RepositorySymbol] = []
+
+    def visit(nodes: list[ast.AST], parent: str | None = None) -> None:
+        for node in nodes:
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets: list[ast.AST] = []
+                if isinstance(node, ast.Assign):
+                    targets.extend(node.targets)
+                else:
+                    targets.append(node.target)
+                for target in targets:
+                    if not isinstance(target, ast.Name):
+                        continue
+                    if parent is None and not target.id.isupper():
+                        continue
+                    name = f"{parent}.{target.id}" if parent else target.id
+                    symbols.append(
+                        RepositorySymbol(
+                            relative,
+                            name,
+                            "constant" if parent is None else "attribute",
+                            node.lineno,
+                            getattr(node, "end_lineno", node.lineno),
+                            name,
+                        )
+                    )
+            elif isinstance(node, ast.ClassDef):
+                name = f"{parent}.{node.name}" if parent else node.name
+                symbols.append(
+                    RepositorySymbol(
+                        relative,
+                        name,
+                        "class",
+                        node.lineno,
+                        getattr(node, "end_lineno", node.lineno),
+                        f"class {node.name}",
+                    )
+                )
+                visit(node.body, name)
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                name = f"{parent}.{node.name}" if parent else node.name
+                try:
+                    arguments = ast.unparse(node.args)
+                except Exception:
+                    arguments = "(...)"
+                kind = "method" if parent else "function"
+                if name.startswith("test") or ".test_" in name:
+                    kind = "test"
+                prefix = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+                symbols.append(
+                    RepositorySymbol(
+                        relative,
+                        name,
+                        kind,
+                        node.lineno,
+                        getattr(node, "end_lineno", node.lineno),
+                        f"{prefix} {node.name}({arguments})",
+                    )
+                )
+                # Nested functions are implementation details; their parent is
+                # enough for the first-pass map and keeps the context compact.
+
+    visit(tree.body)
+    return symbols
+
+
+def build_repository_index(root: Path) -> RepositoryIndex:
+    """Build or reuse a structural map for the checked-out revision."""
+    root = root.resolve()
+    revision = _repository_revision(root)
+    key = (str(root), revision, REPOSITORY_INDEX_VERSION)
+    cached = _REPOSITORY_INDEX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    paths = _index_files(root)
+    files = tuple(path.relative_to(root).as_posix() for path in paths)
+    symbols: list[RepositorySymbol] = []
+    for path in paths:
+        if path.suffix.lower() in {".py", ".pyi"}:
+            symbols.extend(_python_symbols(root, path))
+    index = RepositoryIndex(revision, files, tuple(symbols))
+    _REPOSITORY_INDEX_CACHE[key] = index
+    return index
 
 
 def _truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
@@ -554,7 +782,7 @@ TOOLS: list[dict[str, Any]] = [
 SYSTEM_PROMPT = """
 You are a careful software engineering agent fixing one GitHub issue.
 
-You have a small number of tool turns, so work quickly and reserve enough turns to
+You have a small number of model calls, so work quickly and reserve enough calls to
 edit, test, and finish:
 1. Use search_code to locate the relevant symbol or behavior. Search uses literal text
    and returns line numbers with nearby context.
@@ -574,11 +802,11 @@ edit, test, and finish:
    unrelated code.
 
 Execution constraints:
-- You should normally make the first edit within 4-5 model turns.
+- You should normally make the first edit within 4-5 model calls.
 - Do not repeatedly search for code you have already located.
 - Do not inspect unrelated initialization or entrypoint code unless required.
 - Do not search broadly for tests when the repository already contains an obvious test file.
-- Reserve at least two turns after the first edit for testing and finalizing.
+- Reserve at least two calls after the first edit for testing and finalizing.
 - When changing a CLI, API, parser, or validation path, inspect downstream callers and
   update relevant tests before declaring the change complete. Declare each argument
   exactly once, and test both the new invocation and the existing normal invocation.
@@ -594,7 +822,14 @@ Rules:
 
 
 class Model(Protocol):
-    def create(self, *, instructions: str, input_items: list[Any], tools: list[dict[str, Any]]) -> Any:
+    def create(
+        self,
+        *,
+        instructions: str,
+        input_items: list[Any],
+        tools: list[dict[str, Any]],
+        tool_choice: Any | None = None,
+    ) -> Any:
         ...
 
 
@@ -609,13 +844,26 @@ class OpenAIModel:
         self.model = model
         self.client = OpenAI()
 
-    def create(self, *, instructions: str, input_items: list[Any], tools: list[dict[str, Any]]) -> Any:
-        return self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=input_items,
-            tools=tools,
-        )
+    def create(
+        self,
+        *,
+        instructions: str,
+        input_items: list[Any],
+        tools: list[dict[str, Any]],
+        tool_choice: Any | None = None,
+    ) -> Any:
+        request: dict[str, Any] = {
+            "model": self.model,
+            "instructions": instructions,
+            "input": input_items,
+            "tools": tools,
+        }
+        if tool_choice is not None:
+            request["tool_choice"] = {
+                "type": "function",
+                "name": tool_choice["function"]["name"],
+            }
+        return self.client.responses.create(**request)
 
 
 class GeminiModel:
@@ -691,13 +939,15 @@ class GeminiModel:
         instructions: str,
         input_items: list[Any],
         tools: list[dict[str, Any]],
+        tool_choice: Any | None = None,
     ) -> Any:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=self._messages(instructions, input_items),
-            tools=self._chat_tools(tools),
-            tool_choice="auto",
-        )
+        request: dict[str, Any] = {
+            "model": self.model,
+            "messages": self._messages(instructions, input_items),
+            "tools": self._chat_tools(tools),
+            "tool_choice": "auto" if tool_choice is None else tool_choice,
+        }
+        response = self.client.chat.completions.create(**request)
         if not response.choices:
             raise AgentError("Gemini returned no completion choices")
 
@@ -918,6 +1168,7 @@ def run_mini_agent(
     provider: str,
     model: str,
     max_steps: int,
+    budget: RunBudget | None = None,
     log: Callable[[str], None] = print,
 ) -> AgentResult:
     """Run mini-SWE-agent as an optional, Docker-isolated inner agent.
@@ -925,6 +1176,10 @@ def run_mini_agent(
     The outer harness still owns branch creation, validation, testing, commits,
     pushes, and pull requests. The mini agent only edits a temporary checkout copy.
     """
+    if budget is not None:
+        max_steps = min(max_steps, budget.remaining)
+    if max_steps <= 0:
+        raise AgentError("No model-call budget remains for the mini engine.")
     if shutil.which("docker") is None:
         raise AgentError(
             "The mini engine requires Docker. Install Docker and build the sandbox "
@@ -947,18 +1202,20 @@ def run_mini_agent(
         ) from exc
 
     class FocusedMiniAgent(DefaultAgent):
-        """Add a hard implementation deadline to mini's bash loop."""
+        """Bound unproductive exploration without forbidding targeted reads."""
 
         def __init__(self, *args: Any, **kwargs: Any):
             self.edit_made = False
+            self.no_edit_calls_after_deadline = 0
             super().__init__(*args, **kwargs)
 
         def query(self) -> dict[str, Any]:
             if not self.edit_made and self.n_calls >= MINI_EDIT_DEADLINE_CALL - 1:
                 if self.n_calls >= MINI_EDIT_DEADLINE_CALL:
                     message = (
-                        "Implementation deadline reached. Read-only commands are blocked "
-                        "until you edit a source or test file. Issue one edit command now."
+                        "Implementation checkpoint reached. A targeted read is still allowed "
+                        "if needed, but do not repeat exploration. Make the smallest edit "
+                        "as soon as you have enough context."
                     )
                 else:
                     message = (
@@ -970,29 +1227,9 @@ def run_mini_agent(
 
         def execute_actions(self, message: dict) -> list[dict]:
             outputs: list[dict[str, Any]] = []
-            blocked_read_only_command = False
             for action in message.get("extra", {}).get("actions", []):
                 command = str(action.get("command", ""))
                 log(f"Mini step {self.n_calls}: bash {_truncate(command, 500)}")
-                if (
-                    not self.edit_made
-                    and self.n_calls >= MINI_EDIT_DEADLINE_CALL
-                    and not mini_command_makes_edit(command)
-                ):
-                    log("Mini command blocked until the agent edits a file")
-                    blocked_read_only_command = True
-                    outputs.append(
-                        {
-                            "output": (
-                                "Blocked: you have reached the implementation deadline. "
-                                "Use one shell command that edits the source or test file now."
-                            ),
-                            "returncode": 1,
-                            "exception_info": "",
-                        }
-                    )
-                    continue
-
                 output = self.env.execute(action)
                 outputs.append(output)
                 if output.get("returncode") == 0 and (
@@ -1000,15 +1237,29 @@ def run_mini_agent(
                     or _mini_snapshot(sandbox_root) != sandbox_before
                 ):
                     self.edit_made = True
+                    self.no_edit_calls_after_deadline = 0
+                elif (
+                    not self.edit_made
+                    and self.n_calls >= MINI_EDIT_DEADLINE_CALL
+                ):
+                    self.no_edit_calls_after_deadline += 1
+                    log(
+                        "Mini progress checkpoint: "
+                        f"{self.no_edit_calls_after_deadline}/{MINI_STALL_CALLS} "
+                        "post-deadline calls without an edit"
+                    )
 
             observation_messages = self.add_messages(
                 *self.model.format_observation_messages(
                     message, outputs, self.get_template_vars()
                 )
             )
-            if blocked_read_only_command and not self.edit_made:
+            if (
+                not self.edit_made
+                and self.no_edit_calls_after_deadline >= MINI_STALL_CALLS
+            ):
                 raise MiniEditDeadlineExceeded(
-                    "The mini agent reached the implementation deadline without editing."
+                    "The mini agent made no implementation progress after its checkpoint."
                 )
             return observation_messages
 
@@ -1065,8 +1316,9 @@ You can execute bash commands and edit files to implement the necessary changes.
 
 ## Required workflow
 
-1. Inspect only the files relevant to the issue.
-2. Make the smallest reasonable implementation edit by model call 7.
+1. Use the repository map and inspect only files relevant to the issue.
+2. Make the smallest reasonable implementation edit after you have enough evidence;
+   do not spend the whole budget rereading the same code.
 3. Run the repository tests after editing and fix failures caused by your change.
 4. Stop exploring once the issue is fixed and the tests pass.
 5. Finish with exactly one bash tool call whose command is:
@@ -1089,6 +1341,8 @@ spend the whole budget reading files: after the relevant code is located, edit i
         f"GitHub issue #{issue['number']}\n"
         f"Title: {issue.get('title', '')}\n\n"
         f"Description:\n{issue.get('body') or '(no issue description)'}\n\n"
+        "Repository map:\n"
+        f"{build_repository_index(root).render(issue.get('title', '') + ' ' + (issue.get('body') or ''))}\n\n"
         "Make the implementation change in the current checkout, verify it with tests, "
         "and then submit the final summary command."
     )
@@ -1129,6 +1383,9 @@ spend the whole budget reading files: after the relevant code is located, edit i
     finally:
         shutil.rmtree(trajectory_directory, ignore_errors=True)
         shutil.rmtree(sandbox_directory, ignore_errors=True)
+
+    if budget is not None:
+        budget.consume(agent.n_calls, phase="mini")
 
     if run_error is not None:
         raise AgentError(f"mini-SWE-agent failed: {run_error}") from run_error
@@ -1171,12 +1428,14 @@ class AgentRunner:
         model: Model,
         *,
         max_steps: int = MAX_STEPS,
+        budget: RunBudget | None = None,
         request_delay: float = 0.0,
         log: Callable[[str], None] = print,
     ):
         self.workspace = workspace
         self.model = model
         self.max_steps = max_steps
+        self.budget = budget
         self.request_delay = max(0.0, request_delay)
         self.log = log
 
@@ -1223,55 +1482,121 @@ class AgentRunner:
         issue_number = issue["number"]
         title = issue.get("title", "")
         body = issue.get("body") or "(no issue description)"
-        repository_files = _truncate(self.workspace.list_files(), MAX_TOOL_OUTPUT)
+        repository_map = build_repository_index(self.workspace.root).render(
+            f"{title} {body}"
+        )
+        initial_prompt = (
+            f"GitHub issue #{issue_number}\n"
+            f"Title: {title}\n\n"
+            f"Description:\n{body}\n\n"
+            f"Repository map:\n{repository_map}\n\n"
+            "Fix this issue in the current repository."
+        )
         input_items: list[Any] = [
             {
                 "role": "user",
-                "content": (
-                    f"GitHub issue #{issue_number}\n"
-                    f"Title: {title}\n\n"
-                    f"Description:\n{body}\n\n"
-                    f"Repository files:\n{repository_files}\n\n"
-                    "Fix this issue in the current repository."
-                ),
+                "content": initial_prompt,
             }
         ]
+        budget = self.budget or RunBudget(self.max_steps)
         search_calls = 0
         edit_made = False
+        phase = "investigate"
+        recovery_turn = False
+        observations: list[str] = []
+        implementation_context_compacted = False
+        seen_actions: set[tuple[str, str]] = set()
+        stale_actions = 0
+        last_step = 0
 
-        for step in range(1, self.max_steps + 1):
+        step_limit = self.max_steps
+        step_limit = min(step_limit, budget.remaining)
+
+        for step in range(1, step_limit + 1):
+            while budget.phase_remaining(phase) <= 0:
+                if phase == "investigate":
+                    phase = "implement"
+                    recovery_turn = False
+                elif phase == "implement" and not edit_made:
+                    phase = "repair"
+                    recovery_turn = True
+                else:
+                    break
+            if budget.phase_remaining(phase) <= 0:
+                break
+
+            last_step = step
             self.log(f"\n--- Agent step {step} ---")
             if step > 1 and self.request_delay:
                 time.sleep(self.request_delay)
 
-            allowed_tools = TOOLS
-            if edit_made:
+            if phase == "investigate":
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] != "run_tests"
+                ]
+                if search_calls >= 2:
+                    allowed_tools = [
+                        tool
+                        for tool in allowed_tools
+                        if tool["name"] != "search_code"
+                    ]
+            elif phase == "implement":
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] == "edit_file"
+                ]
+            elif phase == "repair" and recovery_turn:
+                allowed_tools = [
+                    tool
+                    for tool in TOOLS
+                    if tool["name"] in {"read_file", "edit_file"}
+                ]
+            elif phase == "repair":
+                allowed_tools = [
+                    tool for tool in TOOLS if tool["name"] == "edit_file"
+                ]
+            else:
                 allowed_tools = [
                     tool
                     for tool in TOOLS
                     if tool["name"] in {"read_file", "edit_file", "run_tests"}
                 ]
-            elif search_calls >= 2:
-                allowed_tools = [
-                    tool for tool in TOOLS if tool["name"] != "search_code"
-                ]
-            if step >= 6 and not edit_made:
-                allowed_tools = [
-                    tool
-                    for tool in allowed_tools
-                    if tool["name"] in {"read_file", "edit_file"}
-                ]
-            if step >= 7 and not edit_made:
-                allowed_tools = [
-                    tool for tool in allowed_tools if tool["name"] == "edit_file"
-                ]
             allowed_tool_names = {tool["name"] for tool in allowed_tools}
+            force_edit = phase == "implement" or (
+                phase == "repair" and not recovery_turn
+            )
+            tool_choice = (
+                {
+                    "type": "function",
+                    "function": {"name": "edit_file"},
+                }
+                if force_edit
+                else None
+            )
 
-            remaining = self.max_steps - step + 1
+            if phase == "implement" and not implementation_context_compacted:
+                evidence = _truncate(
+                    "\n\n".join(observations), MAX_TOOL_OUTPUT
+                )
+                input_items = [
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{initial_prompt}\n\n"
+                            "Relevant evidence collected during localization:\n"
+                            f"{evidence or '(No successful read was collected; use the map.)'}\n\n"
+                            "The implementation phase has started. Apply the smallest correct edit."
+                        ),
+                    }
+                ]
+                implementation_context_compacted = True
+
+            remaining = min(self.max_steps - step + 1, budget.remaining)
             turn_instructions = (
                 f"{SYSTEM_PROMPT}\n\n"
-                f"CURRENT TURN: {step} of {self.max_steps}\n"
-                f"TURNS REMAINING INCLUDING THIS ONE: {remaining}\n"
+                f"PHASE: {phase.upper()}\n"
+                f"CURRENT MODEL CALL: {step} of {self.max_steps}\n"
+                f"GLOBAL CALLS REMAINING INCLUDING THIS ONE: {remaining}\n"
+                f"PHASE CALLS REMAINING: {budget.phase_remaining(phase)}\n"
                 f"SEARCH CALLS USED: {search_calls} of 2\n"
             )
             if search_calls >= 2:
@@ -1279,29 +1604,49 @@ class AgentRunner:
                     "You have exhausted your search budget. Do not continue exploring "
                     "the repository; use the information already gathered.\n"
                 )
-            if step >= 6 and not edit_made:
+            if phase == "investigate":
                 turn_instructions += (
-                    "You must make an edit now unless you are genuinely blocked. "
-                    "Only read_file and edit_file are available in this phase.\n"
+                    "Investigate only enough to identify the likely root cause and "
+                    "target edit. Repeated observations will be rejected.\n"
                 )
-            if step >= 7 and not edit_made:
+            elif phase == "implement":
                 turn_instructions += (
-                    "You have not edited any code yet. Make the smallest reasonable "
-                    "edit now; edit_file is the only available tool.\n"
+                    "Investigation is complete for this run. "
+                    "Call edit_file now. Do not call a read or search tool.\n"
+                )
+            elif phase == "repair" and recovery_turn:
+                turn_instructions += (
+                    "The previous edit attempt did not apply. Make one "
+                    "targeted read_file call to correct the exact replacement, "
+                    "then call edit_file. Do not resume general exploration.\n"
+                )
+            elif phase == "repair":
+                turn_instructions += (
+                    "Repair the current patch with edit_file now. Do not read or "
+                    "search again.\n"
+                )
+            else:
+                turn_instructions += (
+                    "Verify the change with run_tests. If a test fails, make a "
+                    "focused repair and rerun it; otherwise finish with a summary.\n"
                 )
             if remaining <= 3:
                 turn_instructions += (
-                    "Stop exploring. Edit, test, and finalize now; do not make another "
-                    "unnecessary search or read.\n"
+                    "Use the remaining calls only for implementation, testing, or "
+                    "finalizing; do not start new exploration.\n"
                 )
 
             for attempt in range(2):
                 try:
-                    response = self.model.create(
-                        instructions=turn_instructions,
-                        input_items=input_items,
-                        tools=allowed_tools,
-                    )
+                    budget.consume(phase=phase)
+                    request: dict[str, Any] = {
+                        "instructions": turn_instructions,
+                        "input_items": input_items,
+                        "tools": allowed_tools,
+                    }
+                    if tool_choice is not None:
+                        request["tool_choice"] = tool_choice
+                    response = self.model.create(**request)
                     break
                 except Exception as exc:
                     retry_delay = _rate_limit_delay(exc)
@@ -1318,9 +1663,42 @@ class AgentRunner:
                 item for item in output_items if _item_value(item, "type") == "function_call"
             ]
             if not tool_calls:
+                if force_edit:
+                    if phase == "implement":
+                        phase = "repair"
+                        recovery_turn = True
+                    else:
+                        recovery_turn = False
+                    input_items.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "The implementation is not complete. Use the available "
+                                "edit_file tool on your next turn."
+                            ),
+                        }
+                    )
+                    continue
+                if recovery_turn:
+                    recovery_turn = False
+                    input_items.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Do not finish without applying the fix. Call edit_file "
+                                "on your next turn."
+                            ),
+                        }
+                    )
+                    continue
+                if phase == "investigate":
+                    phase = "implement"
+                    continue
                 final_message = _item_value(response, "output_text", "") or "Agent finished without a summary."
                 return AgentResult(str(final_message), step)
 
+            edit_succeeded = False
+            test_failure_transition = False
             for call in tool_calls:
                 name = _item_value(call, "name")
                 raw_arguments = _item_value(call, "arguments", "{}")
@@ -1338,13 +1716,41 @@ class AgentRunner:
                         arguments = json.loads(raw_arguments)
                         if not isinstance(arguments, dict):
                             raise ValueError("tool arguments must be a JSON object")
-                        result = self.workspace.call_tool(name, arguments)
+                        action_key = (
+                            name,
+                            json.dumps(arguments, sort_keys=True, separators=(",", ":")),
+                        )
+                        if name in {"search_code", "read_file"} and action_key in seen_actions:
+                            result = (
+                                "ALREADY_OBSERVED: this exact search or read was "
+                                "already performed. Use its existing result or edit."
+                            )
+                            stale_actions += 1
+                        else:
+                            if name in {"search_code", "read_file"}:
+                                seen_actions.add(action_key)
+                            result = self.workspace.call_tool(name, arguments)
+                            if name in {"search_code", "read_file"}:
+                                stale_actions = 0
                     except Exception as exc:
                         result = f"TOOL ERROR: {type(exc).__name__}: {exc}"
                     if name == "edit_file" and result.startswith(
                         ("Successfully edited", "Successfully created")
                     ):
                         edit_made = True
+                        edit_succeeded = True
+                    elif name in {"search_code", "read_file"} and not result.startswith(
+                        ("ERROR:", "TOOL ERROR:")
+                    ):
+                        observations.append(f"{name}:\n{_truncate(result, 4_000)}")
+                    elif name == "run_tests":
+                        try:
+                            if json.loads(result).get("status") == "failed":
+                                phase = "repair"
+                                recovery_turn = True
+                                test_failure_transition = True
+                        except (TypeError, json.JSONDecodeError):
+                            pass
                 self.log(_truncate(result, 1_000))
                 input_items.append(
                     {
@@ -1354,18 +1760,33 @@ class AgentRunner:
                     }
                 )
 
+            if edit_succeeded:
+                phase = "verify"
+                recovery_turn = False
+            elif force_edit and phase == "implement":
+                phase = "repair"
+                recovery_turn = True
+            elif force_edit and phase == "repair":
+                recovery_turn = False
+            elif recovery_turn and not test_failure_transition:
+                recovery_turn = False
+            elif phase == "investigate" and stale_actions >= 2:
+                phase = "implement"
+
         if self._has_worktree_changes():
             message = (
-                f"Agent reached the maximum of {self.max_steps} steps after making "
+                f"Agent finished its phase budget after making "
                 "a change without returning a final summary.\n\n"
                 f"{self._change_summary()}\n\n"
                 "The harness will run the final tests and prepare the pull request "
                 "if they pass."
             )
             self.log(message)
-            return AgentResult(message, self.max_steps)
+            return AgentResult(message, last_step)
 
-        raise AgentError(f"Agent exceeded the maximum of {self.max_steps} steps without making a change")
+        raise AgentError(
+            "Agent exhausted its bounded phase budgets without making a change"
+        )
 
 
 def repository_root(start: Path) -> Path:
@@ -1613,6 +2034,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.max_steps <= 0:
         raise AgentError("max_steps must be positive")
 
+    budget = RunBudget(args.max_steps)
+
     root = repository_root(Path.cwd())
     require_clean_worktree(root)
     issue = get_issue(root, args.issue_number)
@@ -1635,17 +2058,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             issue,
             provider=args.provider,
             model=args.model,
-            max_steps=args.max_steps,
+            max_steps=min(budget.remaining, MINI_MAX_CALLS),
+            budget=budget,
         )
         if not has_worktree_changes(root):
+            if budget.remaining <= 0:
+                raise AgentError(
+                    "The global model-call budget was exhausted without an edit; "
+                    "no pull request was created."
+                )
             print(
-                "\nMini agent made no edit. Retrying with the focused tool agent "
-                "so this issue does not consume the remaining mini steps."
+                f"\nMini agent made no edit. Retrying with the focused tool agent "
+                f"using the {budget.remaining} remaining model calls."
             )
             runner = AgentRunner(
                 workspace,
                 create_model(args.provider, args.model),
-                max_steps=args.max_steps,
+                max_steps=budget.remaining,
+                budget=budget,
                 request_delay=(
                     float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
                     if args.provider == "gemini"
@@ -1658,6 +2088,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             workspace,
             create_model(args.provider, args.model),
             max_steps=args.max_steps,
+            budget=budget,
             request_delay=(
                 float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
                 if args.provider == "gemini"

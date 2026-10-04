@@ -1036,7 +1036,7 @@ def mini_model_name(provider: str, model: str) -> str:
 
 def mini_docker_run_args(root: Path) -> list[str]:
     """Build the mini agent's isolated, repository-only Docker arguments."""
-    return [
+    args = [
         "--rm",
         "--network",
         "none",
@@ -1047,6 +1047,11 @@ def mini_docker_run_args(root: Path) -> list[str]:
         "-v",
         f"{root.resolve()}:/workspace:rw",
     ]
+    # The sandbox drops CAP_DAC_OVERRIDE, so the container must use the host
+    # checkout owner's numeric identity to write the mounted files.
+    if hasattr(os, "getuid") and hasattr(os, "getgid"):
+        args[4:4] = ["--user", f"{os.getuid()}:{os.getgid()}"]
+    return args
 
 
 def mini_command_makes_edit(command: str) -> bool:

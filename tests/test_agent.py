@@ -191,6 +191,12 @@ class AgentTests(unittest.TestCase):
         docker_args = mini_docker_run_args(repository)
         self.assertIn("none", docker_args)
         self.assertIn("--cap-drop=ALL", docker_args)
+        if hasattr(os, "getuid") and hasattr(os, "getgid"):
+            self.assertIn("--user", docker_args)
+            user_index = docker_args.index("--user")
+            self.assertEqual(
+                docker_args[user_index + 1], f"{os.getuid()}:{os.getgid()}"
+            )
         self.assertIn(f"{repository}:/workspace:rw", docker_args)
         self.assertNotIn("GEMINI_API_KEY", docker_args)
         self.assertNotIn("GH_TOKEN", docker_args)

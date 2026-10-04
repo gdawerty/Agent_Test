@@ -25,6 +25,11 @@ from types import SimpleNamespace
 from typing import Any, Callable, Protocol, Sequence
 
 
+def format_greeting(name: str) -> str:
+    return f"Hello, {name}!"
+
+
+
 DEFAULT_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_MODEL = "gpt-5.6"

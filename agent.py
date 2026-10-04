@@ -1064,6 +1064,26 @@ def mini_command_makes_edit(command: str) -> bool:
     return any(re.search(pattern, command, re.IGNORECASE | re.DOTALL) for pattern in patterns)
 
 
+def _mini_changed_paths(
+    before: dict[str, bytes], after: dict[str, bytes]
+) -> set[str]:
+    return {
+        relative
+        for relative in set(before) | set(after)
+        if before.get(relative) != after.get(relative)
+    }
+
+
+def _mini_action_output(output: dict[str, Any]) -> str:
+    """Render bounded command output for workflow diagnostics."""
+    sections: list[str] = []
+    for label, key in (("stdout", "output"), ("stdout", "stdout"), ("stderr", "stderr")):
+        value = output.get(key)
+        if value not in (None, ""):
+            sections.append(f"{label}:\n{_truncate(str(value), 2_000)}")
+    return "\n".join(sections) or "(no command output)"
+
+
 def _mini_copy_ignore(path: str, names: list[str], root: Path) -> list[str]:
     ignored: list[str] = []
     source = Path(path)
@@ -1137,11 +1157,7 @@ def _sync_mini_sandbox(
 ) -> None:
     """Copy safe mini-agent changes back and reject protected-file changes."""
     after = _mini_snapshot(sandbox_root)
-    changed = {
-        relative
-        for relative in set(before) | set(after)
-        if before.get(relative) != after.get(relative)
-    }
+    changed = _mini_changed_paths(before, after)
     protected = sorted(
         relative
         for relative in changed
@@ -1160,6 +1176,18 @@ def _sync_mini_sandbox(
             target.write_bytes(after[relative])
         elif target.exists():
             target.unlink()
+
+    synced = _mini_snapshot(root)
+    failed = sorted(
+        relative
+        for relative in changed
+        if synced.get(relative) != after.get(relative)
+    )
+    if failed:
+        raise AgentError(
+            "The mini agent changed files that could not be synchronized from the "
+            "sandbox:\n" + "\n".join(failed)
+        )
 
 
 def run_mini_agent(
@@ -1231,12 +1259,16 @@ def run_mini_agent(
             for action in message.get("extra", {}).get("actions", []):
                 command = str(action.get("command", ""))
                 log(f"Mini step {self.n_calls}: bash {_truncate(command, 500)}")
+                action_before = _mini_snapshot(sandbox_root)
                 output = self.env.execute(action)
+                action_after = _mini_snapshot(sandbox_root)
+                action_changed = bool(_mini_changed_paths(action_before, action_after))
                 outputs.append(output)
-                if output.get("returncode") == 0 and (
-                    mini_command_makes_edit(command)
-                    or _mini_snapshot(sandbox_root) != sandbox_before
-                ):
+                log(
+                    f"Mini result: exit={output.get('returncode', 'unknown')} "
+                    f"edit_detected={action_changed}\n{_mini_action_output(output)}"
+                )
+                if action_changed:
                     self.edit_made = True
                     self.no_edit_calls_after_deadline = 0
                 elif (

@@ -17,6 +17,7 @@ from agent import (
     RepoWorkspace,
     RunBudget,
     _prepare_mini_sandbox,
+    _mini_snapshot,
     _sync_mini_sandbox,
     build_repository_index,
     find_open_issue_pr,
@@ -220,6 +221,36 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(
                 (root / ".env").read_text(encoding="utf-8"),
                 "TEST_ONLY=placeholder\n",
+            )
+
+    def test_mini_python_edit_is_synced_even_when_command_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            sandbox_directory, sandbox_root, before = _prepare_mini_sandbox(root)
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; "
+                        "Path('app.py').write_text(\"VALUE = 'fixed'\\n\"); "
+                        "raise SystemExit(1)",
+                    ],
+                    cwd=sandbox_root,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                after = _mini_snapshot(sandbox_root)
+                self.assertNotEqual(before, after)
+                self.assertNotEqual(result.returncode, 0)
+                _sync_mini_sandbox(root, sandbox_root, before)
+            finally:
+                shutil.rmtree(sandbox_directory, ignore_errors=True)
+            self.assertEqual(
+                (root / "app.py").read_text(encoding="utf-8"),
+                "VALUE = 'fixed'\n",
             )
 
     def test_worktree_change_detection_includes_untracked_files(self):

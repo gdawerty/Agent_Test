@@ -89,6 +89,8 @@ Protect the `main` branch in **Settings → Rules → Rulesets** or **Settings �
 
 The harness refuses agent edits to workflow, action, credential, and private-key paths. In GitHub Actions, set `AGENT_SANDBOX_TESTS=1` so model-triggered and final tests run in the networkless Docker sandbox instead of on the runner host. The sandbox is read-only except for the checkout and temporary directory, drops capabilities, runs as the checkout owner, and applies CPU, memory, and process limits. The workflow also disables checkout credential persistence and configures push authentication only after validation succeeds. If an issue already has an open automated pull request, a rerun reports that pull request instead of creating a duplicate; a stale branch receives a retry suffix.
 
+The workflows cache pip downloads and Docker BuildKit layers. The sandbox build context contains only `Dockerfile.agent` and `requirements.txt`, so changes to application files do not invalidate the image build. The default twelve-call budget can be changed without editing the workflow by setting the repository variable `AGENT_MAX_STEPS`; keep this bounded because it controls model spend and wall-clock time.
+
 ## Optional mini-SWE-agent engine
 
 The default engine remains the small custom tool loop above. This repository also includes an experimental mini-SWE-agent engine for comparison. It uses mini-SWE-agent's single bash tool, LiteLLM's Gemini adapter, and a Docker execution environment, while this outer harness continues to own branch creation, protected-path validation, final tests, commits, pushes, and pull requests.

@@ -34,7 +34,6 @@ MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 15
 MAX_READ_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
-CUSTOM_EDIT_FORCE_CALL = 7
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
 MINI_EDIT_DEADLINE_CALL = 7
@@ -595,14 +594,7 @@ Rules:
 
 
 class Model(Protocol):
-    def create(
-        self,
-        *,
-        instructions: str,
-        input_items: list[Any],
-        tools: list[dict[str, Any]],
-        tool_choice: Any | None = None,
-    ) -> Any:
+    def create(self, *, instructions: str, input_items: list[Any], tools: list[dict[str, Any]]) -> Any:
         ...
 
 
@@ -617,33 +609,13 @@ class OpenAIModel:
         self.model = model
         self.client = OpenAI()
 
-    def create(
-        self,
-        *,
-        instructions: str,
-        input_items: list[Any],
-        tools: list[dict[str, Any]],
-        tool_choice: Any | None = None,
-    ) -> Any:
-        request: dict[str, Any] = {
-            "model": self.model,
-            "instructions": instructions,
-            "input": input_items,
-            "tools": tools,
-        }
-        if tool_choice is not None:
-            if (
-                isinstance(tool_choice, dict)
-                and tool_choice.get("type") == "function"
-                and isinstance(tool_choice.get("function"), dict)
-            ):
-                request["tool_choice"] = {
-                    "type": "function",
-                    "name": tool_choice["function"]["name"],
-                }
-            else:
-                request["tool_choice"] = tool_choice
-        return self.client.responses.create(**request)
+    def create(self, *, instructions: str, input_items: list[Any], tools: list[dict[str, Any]]) -> Any:
+        return self.client.responses.create(
+            model=self.model,
+            instructions=instructions,
+            input=input_items,
+            tools=tools,
+        )
 
 
 class GeminiModel:
@@ -719,15 +691,13 @@ class GeminiModel:
         instructions: str,
         input_items: list[Any],
         tools: list[dict[str, Any]],
-        tool_choice: Any | None = None,
     ) -> Any:
-        request: dict[str, Any] = {
-            "model": self.model,
-            "messages": self._messages(instructions, input_items),
-            "tools": self._chat_tools(tools),
-            "tool_choice": "auto" if tool_choice is None else tool_choice,
-        }
-        response = self.client.chat.completions.create(**request)
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=self._messages(instructions, input_items),
+            tools=self._chat_tools(tools),
+            tool_choice="auto",
+        )
         if not response.choices:
             raise AgentError("Gemini returned no completion choices")
 
@@ -1296,15 +1266,6 @@ class AgentRunner:
                     tool for tool in allowed_tools if tool["name"] == "edit_file"
                 ]
             allowed_tool_names = {tool["name"] for tool in allowed_tools}
-            force_edit = step >= CUSTOM_EDIT_FORCE_CALL and not edit_made
-            tool_choice = (
-                {
-                    "type": "function",
-                    "function": {"name": "edit_file"},
-                }
-                if force_edit
-                else None
-            )
 
             remaining = self.max_steps - step + 1
             turn_instructions = (
@@ -1340,7 +1301,6 @@ class AgentRunner:
                         instructions=turn_instructions,
                         input_items=input_items,
                         tools=allowed_tools,
-                        tool_choice=tool_choice,
                     )
                     break
                 except Exception as exc:
@@ -1358,11 +1318,6 @@ class AgentRunner:
                 item for item in output_items if _item_value(item, "type") == "function_call"
             ]
             if not tool_calls:
-                if force_edit and not edit_made:
-                    raise AgentError(
-                        "The model did not produce the required edit_file call "
-                        f"by step {step}"
-                    )
                 final_message = _item_value(response, "output_text", "") or "Agent finished without a summary."
                 return AgentResult(str(final_message), step)
 
@@ -1372,11 +1327,6 @@ class AgentRunner:
                 call_id = _item_value(call, "call_id")
                 self.log(f"Tool: {name}({raw_arguments})")
                 if name not in allowed_tool_names:
-                    if force_edit:
-                        raise AgentError(
-                            f"The model requested {name} after the edit deadline; "
-                            "the only permitted tool is edit_file"
-                        )
                     result = (
                         f"TOOL ERROR: {name} is unavailable in the current phase; "
                         "use one of the available tools."

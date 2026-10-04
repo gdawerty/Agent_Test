@@ -1100,6 +1100,33 @@ def _mini_action_output(output: dict[str, Any]) -> str:
     return "\n".join(sections) or "(no command output)"
 
 
+def mini_test_command(root: Path) -> str:
+    """Return the host-detected test command in a container-safe form."""
+    command = RepoWorkspace(root)._test_command()
+    if command is None:
+        return "(no supported test command was detected)"
+    if command[0] == sys.executable:
+        command = ["python3", *command[1:]]
+    return shlex.join(command)
+
+
+def mini_edit_required_output() -> dict[str, Any]:
+    """Return a mini-SWE-agent-compatible rejected-action observation."""
+    message = (
+        "EDIT_REQUIRED: the implementation checkpoint has been reached. Use a bash "
+        "command that modifies a repository file before reading, testing, or finishing."
+    )
+    return {
+        "returncode": 2,
+        "output": message,
+        "exception_info": "Command rejected by the outer harness: an implementation edit is required.",
+        "extra": {
+            "exception_type": "MiniEditRequired",
+            "exception": message,
+        },
+    }
+
+
 def _mini_copy_ignore(path: str, names: list[str], root: Path) -> list[str]:
     ignored: list[str] = []
     source = Path(path)
@@ -1278,14 +1305,7 @@ def run_mini_agent(
                 if not mini_command_allowed(
                     command, calls=self.n_calls, edit_made=self.edit_made
                 ):
-                    output = {
-                        "returncode": 2,
-                        "output": (
-                            "EDIT_REQUIRED: the implementation checkpoint has been "
-                            "reached. Use a bash command that modifies a repository file "
-                            "before reading, testing, or finishing."
-                        ),
-                    }
+                    output = mini_edit_required_output()
                     outputs.append(output)
                     log(
                         "Mini result: exit=2 edit_detected=False command_rejected=True\n"
@@ -1330,6 +1350,7 @@ def run_mini_agent(
             return observation_messages
 
     image = os.environ.get("MINI_DOCKER_IMAGE", MINI_DEFAULT_IMAGE)
+    test_command = mini_test_command(root)
     try:
         cost_limit = float(
             os.environ.get("MINI_COST_LIMIT", str(MINI_DEFAULT_COST_LIMIT))
@@ -1366,14 +1387,15 @@ def run_mini_agent(
             f"Could not start the mini Docker sandbox using image {image}: {exc}"
         ) from exc
 
-    system_template = """
+    system_template = f"""
 You are a focused software engineer working in /workspace.
 
 Solve the GitHub issue with the smallest correct change. You may inspect, edit,
 and test files in /workspace using bash. Work directly on the provided checkout
-copy. Do not use git, commit, push, open pull requests, access the network, or
+copy. The checkout intentionally has no .git directory, so do not run git commands. Do not commit, push, open pull requests, access the network, or
 inspect credentials. Do not modify .github/workflows, .github/actions, .env files,
-or private-key files. Run the repository's tests after editing.
+or private-key files. Run this exact test command after editing:
+{test_command}
 """.strip()
     instance_template = """
 Please solve this issue: {{ task }}
@@ -1410,7 +1432,7 @@ spend the whole budget reading files: after the relevant code is located, edit i
         "Repository map:\n"
         f"{build_repository_index(root).render(issue.get('title', '') + ' ' + (issue.get('body') or ''))}\n\n"
         "Make the implementation change in the current checkout, verify it with tests, "
-        "and then submit the final summary command."
+        f"using `{test_command}`, and then submit the final summary command."
     )
 
     trajectory_directory = Path(

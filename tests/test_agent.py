@@ -24,6 +24,8 @@ from agent import (
     final_test_status,
     has_worktree_changes,
     mini_command_allowed,
+    mini_edit_required_output,
+    mini_test_command,
     mini_command_makes_edit,
     mini_docker_run_args,
     mini_model_name,
@@ -217,6 +219,12 @@ class AgentTests(unittest.TestCase):
                 edit_made=False,
             )
         )
+        rejected = mini_edit_required_output()
+        self.assertEqual(rejected["returncode"], 2)
+        self.assertIn("EDIT_REQUIRED", rejected["output"])
+        self.assertIn("exception_info", rejected)
+        self.assertIn("extra", rejected)
+        self.assertIn("unittest", mini_test_command(Path(__file__).parent.parent))
         self.assertTrue(
             mini_command_allowed(
                 "python3 -m unittest tests/test_agent.py",

@@ -23,6 +23,7 @@ from agent import (
     find_open_issue_pr,
     final_test_status,
     has_worktree_changes,
+    mini_command_allowed,
     mini_command_makes_edit,
     mini_docker_run_args,
     mini_model_name,
@@ -202,6 +203,27 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", docker_args)
         self.assertFalse(mini_command_makes_edit("rg -n argparse agent.py"))
         self.assertTrue(mini_command_makes_edit("sed -i 's/old/new/' agent.py"))
+        self.assertTrue(
+            mini_command_allowed(
+                "cat >> agent.py <<'EOF'\nchange\nEOF",
+                calls=4,
+                edit_made=False,
+            )
+        )
+        self.assertFalse(
+            mini_command_allowed(
+                "python3 -m unittest tests/test_agent.py",
+                calls=4,
+                edit_made=False,
+            )
+        )
+        self.assertTrue(
+            mini_command_allowed(
+                "python3 -m unittest tests/test_agent.py",
+                calls=4,
+                edit_made=True,
+            )
+        )
         self.assertTrue(
             mini_command_makes_edit(
                 "python - <<'PY'\nPath('agent.py').write_text('updated')\nPY"

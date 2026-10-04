@@ -219,9 +219,10 @@ class AgentTests(unittest.TestCase):
             test_result = json.loads(RepoWorkspace(root).run_tests())
             self.assertEqual(test_result["status"], "passed")
 
-    def test_tool_budget_gates_search_and_forces_an_edit(self):
+    def test_tool_budget_gates_search_without_forcing_a_premature_edit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
             (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
 
             class WanderingModel:
@@ -235,6 +236,7 @@ class AgentTests(unittest.TestCase):
                     scripts = [
                         ("search_code", {"query": "VALUE"}),
                         ("search_code", {"query": "VALUE"}),
+                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
@@ -272,7 +274,7 @@ class AgentTests(unittest.TestCase):
                 model.available_tools[5], {"read_file", "edit_file"}
             )
             self.assertEqual(
-                model.available_tools[6], {"read_file", "edit_file", "run_tests"}
+                model.available_tools[6], {"read_file", "edit_file"}
             )
             self.assertEqual(
                 (root / "app.py").read_text(encoding="utf-8"),

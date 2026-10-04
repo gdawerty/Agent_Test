@@ -37,6 +37,7 @@ GEMINI_REQUEST_DELAY_SECONDS = 5.0
 MINI_DEFAULT_IMAGE = "agent-fix-sandbox:latest"
 MINI_DEFAULT_COST_LIMIT = 3.0
 MINI_EDIT_DEADLINE_CALL = 7
+MINI_STALL_CALLS = 3
 TEST_ENV_ALLOWLIST = {
     "CI",
     "HOME",
@@ -94,7 +95,7 @@ class AgentError(RuntimeError):
 
 
 class MiniEditDeadlineExceeded(RuntimeError):
-    """The mini engine exhausted its investigation window without editing."""
+    """The mini engine stalled after its investigation checkpoint without editing."""
 
 
 def _truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
@@ -947,18 +948,20 @@ def run_mini_agent(
         ) from exc
 
     class FocusedMiniAgent(DefaultAgent):
-        """Add a hard implementation deadline to mini's bash loop."""
+        """Bound unproductive exploration without forbidding targeted reads."""
 
         def __init__(self, *args: Any, **kwargs: Any):
             self.edit_made = False
+            self.no_edit_calls_after_deadline = 0
             super().__init__(*args, **kwargs)
 
         def query(self) -> dict[str, Any]:
             if not self.edit_made and self.n_calls >= MINI_EDIT_DEADLINE_CALL - 1:
                 if self.n_calls >= MINI_EDIT_DEADLINE_CALL:
                     message = (
-                        "Implementation deadline reached. Read-only commands are blocked "
-                        "until you edit a source or test file. Issue one edit command now."
+                        "Implementation checkpoint reached. A targeted read is still allowed "
+                        "if needed, but do not repeat exploration. Make the smallest edit "
+                        "as soon as you have enough context."
                     )
                 else:
                     message = (
@@ -970,29 +973,9 @@ def run_mini_agent(
 
         def execute_actions(self, message: dict) -> list[dict]:
             outputs: list[dict[str, Any]] = []
-            blocked_read_only_command = False
             for action in message.get("extra", {}).get("actions", []):
                 command = str(action.get("command", ""))
                 log(f"Mini step {self.n_calls}: bash {_truncate(command, 500)}")
-                if (
-                    not self.edit_made
-                    and self.n_calls >= MINI_EDIT_DEADLINE_CALL
-                    and not mini_command_makes_edit(command)
-                ):
-                    log("Mini command blocked until the agent edits a file")
-                    blocked_read_only_command = True
-                    outputs.append(
-                        {
-                            "output": (
-                                "Blocked: you have reached the implementation deadline. "
-                                "Use one shell command that edits the source or test file now."
-                            ),
-                            "returncode": 1,
-                            "exception_info": "",
-                        }
-                    )
-                    continue
-
                 output = self.env.execute(action)
                 outputs.append(output)
                 if output.get("returncode") == 0 and (
@@ -1000,15 +983,29 @@ def run_mini_agent(
                     or _mini_snapshot(sandbox_root) != sandbox_before
                 ):
                     self.edit_made = True
+                    self.no_edit_calls_after_deadline = 0
+                elif (
+                    not self.edit_made
+                    and self.n_calls >= MINI_EDIT_DEADLINE_CALL
+                ):
+                    self.no_edit_calls_after_deadline += 1
+                    log(
+                        "Mini progress checkpoint: "
+                        f"{self.no_edit_calls_after_deadline}/{MINI_STALL_CALLS} "
+                        "post-deadline calls without an edit"
+                    )
 
             observation_messages = self.add_messages(
                 *self.model.format_observation_messages(
                     message, outputs, self.get_template_vars()
                 )
             )
-            if blocked_read_only_command and not self.edit_made:
+            if (
+                not self.edit_made
+                and self.no_edit_calls_after_deadline >= MINI_STALL_CALLS
+            ):
                 raise MiniEditDeadlineExceeded(
-                    "The mini agent reached the implementation deadline without editing."
+                    "The mini agent made no implementation progress after its checkpoint."
                 )
             return observation_messages
 
@@ -1261,10 +1258,6 @@ class AgentRunner:
                     for tool in allowed_tools
                     if tool["name"] in {"read_file", "edit_file"}
                 ]
-            if step >= 7 and not edit_made:
-                allowed_tools = [
-                    tool for tool in allowed_tools if tool["name"] == "edit_file"
-                ]
             allowed_tool_names = {tool["name"] for tool in allowed_tools}
 
             remaining = self.max_steps - step + 1
@@ -1286,8 +1279,9 @@ class AgentRunner:
                 )
             if step >= 7 and not edit_made:
                 turn_instructions += (
-                    "You have not edited any code yet. Make the smallest reasonable "
-                    "edit now; edit_file is the only available tool.\n"
+                    "You are at the implementation checkpoint. A targeted read_file "
+                    "call remains available if necessary, but do not repeat exploration. "
+                    "Edit as soon as you have enough context.\n"
                 )
             if remaining <= 3:
                 turn_instructions += (

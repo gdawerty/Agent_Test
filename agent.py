@@ -35,6 +35,7 @@ MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
 MAX_STEPS = 12
 MAX_READ_LINES = 200
+MAX_DIFF_LINES = 200
 GEMINI_REQUEST_DELAY_SECONDS = 5.0
 PHASE_BUDGETS = {
     "investigate": 4,
@@ -1970,6 +1971,46 @@ def validate_agent_changes(root: Path) -> None:
         )
 
 
+def count_worktree_diff_lines(root: Path) -> int:
+    total = 0
+    tracked_diff = _run_process(["git", "diff", "--numstat"], cwd=root, check=False)
+    for line in tracked_diff.splitlines():
+        parts = line.split("	", 2)
+        if len(parts) < 3:
+            continue
+        added, removed, _path = parts
+        if added != "-":
+            total += int(added)
+        if removed != "-":
+            total += int(removed)
+
+    untracked = _run_process(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=root,
+        check=False,
+    )
+    for relative_path in (line.strip() for line in untracked.splitlines() if line.strip()):
+        file_path = root / relative_path
+        if not file_path.is_file():
+            continue
+        try:
+            with file_path.open("r", encoding="utf-8", errors="surrogateescape") as handle:
+                total += sum(1 for _ in handle)
+        except OSError:
+            continue
+    return total
+
+
+def validate_diff_line_limit(root: Path, max_diff_lines: int) -> int:
+    changed_lines = count_worktree_diff_lines(root)
+    if changed_lines > max_diff_lines:
+        raise AgentError(
+            "The agent produced too many changed lines; no commit, push, or pull "
+            f"request was created. Limit: {max_diff_lines}. Actual: {changed_lines}."
+        )
+    return changed_lines
+
+
 def has_worktree_changes(root: Path) -> bool:
     """Return whether the agent produced tracked or untracked worktree changes."""
     status = _run_process(
@@ -2140,6 +2181,12 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Maximum model turns (default: {MAX_STEPS})",
     )
     parser.add_argument(
+        "--max-diff-lines",
+        type=int,
+        default=MAX_DIFF_LINES,
+        help=f"Maximum added and removed lines allowed in the final diff (default: {MAX_DIFF_LINES})",
+    )
+    parser.add_argument(
         "--provider",
         default=provider,
         choices=["gemini", "openai"],
@@ -2181,6 +2228,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise AgentError("issue_number must be positive")
     if args.max_steps <= 0:
         raise AgentError("max_steps must be positive")
+    if args.max_diff_lines <= 0:
+        raise AgentError("max_diff_lines must be positive")
 
     budget = RunBudget(args.max_steps)
     model_chain = parse_model_chain(
@@ -2281,6 +2330,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("\nAgent finished:")
     print(result.final_message)
     validate_agent_changes(root)
+    changed_lines = validate_diff_line_limit(root, args.max_diff_lines)
     test_result = final_test_status(workspace)
     print(f"\nFinal tests: {json.dumps(test_result)}")
 

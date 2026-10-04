@@ -23,6 +23,8 @@ from agent import (
     find_open_issue_pr,
     final_test_status,
     has_worktree_changes,
+    count_worktree_diff_lines,
+    validate_diff_line_limit,
     mini_command_allowed,
     mini_edit_required_output,
     mini_test_command,
@@ -333,6 +335,77 @@ class AgentTests(unittest.TestCase):
                 (root / "app.py").read_text(encoding="utf-8"),
                 "VALUE = 'fixed'\n",
             )
+
+    def test_diff_line_limit_allows_change_below_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("one\ntwo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            (root / "app.py").write_text("one\nchanged\n", encoding="utf-8")
+
+            self.assertEqual(count_worktree_diff_lines(root), 2)
+            self.assertEqual(validate_diff_line_limit(root, 2), 2)
+
+    def test_diff_line_limit_blocks_change_above_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("one\ntwo\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            (root / "app.py").write_text("one\nchanged\n", encoding="utf-8")
+
+            with self.assertRaises(AgentError) as context:
+                validate_diff_line_limit(root, 1)
+            self.assertIn("Limit: 1", str(context.exception))
+            self.assertIn("Actual: 2", str(context.exception))
+
+    def test_diff_line_limit_counts_new_file_lines(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "new_file.py").write_text("a\nb\nc\n", encoding="utf-8")
+
+            self.assertEqual(count_worktree_diff_lines(root), 3)
+
+    def test_max_diff_lines_cli_option_and_default(self):
+        from agent import build_parser
+        parser = build_parser()
+        default_args = parser.parse_args(["12"])
+        custom_args = parser.parse_args(["12", "--max-diff-lines", "17"])
+
+        self.assertEqual(default_args.max_diff_lines, 200)
+        self.assertEqual(custom_args.max_diff_lines, 17)
 
     def test_worktree_change_detection_includes_untracked_files(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -93,6 +93,10 @@ class AgentError(RuntimeError):
     """An expected failure that should be shown as a user-facing CLI error."""
 
 
+class MiniEditDeadlineExceeded(RuntimeError):
+    """The mini engine exhausted its investigation window without editing."""
+
+
 def _truncate(value: str, limit: int = MAX_TOOL_OUTPUT) -> str:
     if len(value) <= limit:
         return value
@@ -966,6 +970,7 @@ def run_mini_agent(
 
         def execute_actions(self, message: dict) -> list[dict]:
             outputs: list[dict[str, Any]] = []
+            blocked_read_only_command = False
             for action in message.get("extra", {}).get("actions", []):
                 command = str(action.get("command", ""))
                 log(f"Mini step {self.n_calls}: bash {_truncate(command, 500)}")
@@ -975,6 +980,7 @@ def run_mini_agent(
                     and not mini_command_makes_edit(command)
                 ):
                     log("Mini command blocked until the agent edits a file")
+                    blocked_read_only_command = True
                     outputs.append(
                         {
                             "output": (
@@ -989,14 +995,22 @@ def run_mini_agent(
 
                 output = self.env.execute(action)
                 outputs.append(output)
-                if output.get("returncode") == 0 and mini_command_makes_edit(command):
+                if output.get("returncode") == 0 and (
+                    mini_command_makes_edit(command)
+                    or _mini_snapshot(sandbox_root) != sandbox_before
+                ):
                     self.edit_made = True
 
-            return self.add_messages(
+            observation_messages = self.add_messages(
                 *self.model.format_observation_messages(
                     message, outputs, self.get_template_vars()
                 )
             )
+            if blocked_read_only_command and not self.edit_made:
+                raise MiniEditDeadlineExceeded(
+                    "The mini agent reached the implementation deadline without editing."
+                )
+            return observation_messages
 
     image = os.environ.get("MINI_DOCKER_IMAGE", MINI_DEFAULT_IMAGE)
     try:
@@ -1099,8 +1113,12 @@ spend the whole budget reading files: after the relevant code is located, edit i
     )
     outcome: dict[str, Any] | None = None
     run_error: Exception | None = None
+    stopped_without_edit = False
     try:
         outcome = agent.run(task)
+    except MiniEditDeadlineExceeded as exc:
+        stopped_without_edit = True
+        log(f"Mini agent stopped early: {exc}")
     except Exception as exc:
         run_error = exc
     finally:
@@ -1114,6 +1132,12 @@ spend the whole budget reading files: after the relevant code is located, edit i
 
     if run_error is not None:
         raise AgentError(f"mini-SWE-agent failed: {run_error}") from run_error
+    if stopped_without_edit:
+        return AgentResult(
+            f"mini-SWE-agent stopped after {agent.n_calls} model calls without making "
+            "an edit; the harness will retry with its focused tool agent.",
+            agent.n_calls,
+        )
     if outcome is None:
         raise AgentError("mini-SWE-agent returned no result")
 
@@ -1386,6 +1410,16 @@ def validate_agent_changes(root: Path) -> None:
         )
 
 
+def has_worktree_changes(root: Path) -> bool:
+    """Return whether the agent produced tracked or untracked worktree changes."""
+    status = _run_process(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=root,
+        check=False,
+    )
+    return bool(status.strip())
+
+
 def get_issue(root: Path, issue_number: int) -> dict[str, Any]:
     raw = _run_process(
         [
@@ -1603,6 +1637,22 @@ def main(argv: Sequence[str] | None = None) -> int:
             model=args.model,
             max_steps=args.max_steps,
         )
+        if not has_worktree_changes(root):
+            print(
+                "\nMini agent made no edit. Retrying with the focused tool agent "
+                "so this issue does not consume the remaining mini steps."
+            )
+            runner = AgentRunner(
+                workspace,
+                create_model(args.provider, args.model),
+                max_steps=args.max_steps,
+                request_delay=(
+                    float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
+                    if args.provider == "gemini"
+                    else 0.0
+                ),
+            )
+            result = runner.run(issue)
     else:
         runner = AgentRunner(
             workspace,

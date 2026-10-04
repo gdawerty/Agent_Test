@@ -19,6 +19,7 @@ from agent import (
     _sync_mini_sandbox,
     find_open_issue_pr,
     final_test_status,
+    has_worktree_changes,
     mini_command_makes_edit,
     mini_docker_run_args,
     mini_model_name,
@@ -121,6 +122,14 @@ class AgentTests(unittest.TestCase):
                 (root / ".env").read_text(encoding="utf-8"),
                 "TEST_ONLY=placeholder\n",
             )
+
+    def test_worktree_change_detection_includes_untracked_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            self.assertFalse(has_worktree_changes(root))
+            (root / "app.py").write_text("VALUE = 'fixed'\n", encoding="utf-8")
+            self.assertTrue(has_worktree_changes(root))
 
     def test_gemini_thought_signature_is_preserved(self):
         signature = "encrypted-signature"

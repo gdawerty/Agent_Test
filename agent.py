@@ -968,11 +968,13 @@ def run_mini_agent(
             outputs: list[dict[str, Any]] = []
             for action in message.get("extra", {}).get("actions", []):
                 command = str(action.get("command", ""))
+                log(f"Mini step {self.n_calls}: bash {_truncate(command, 500)}")
                 if (
                     not self.edit_made
                     and self.n_calls >= MINI_EDIT_DEADLINE_CALL
                     and not mini_command_makes_edit(command)
                 ):
+                    log("Mini command blocked until the agent edits a file")
                     outputs.append(
                         {
                             "output": (
@@ -1036,19 +1038,39 @@ def run_mini_agent(
     system_template = """
 You are a focused software engineer working in /workspace.
 
-Solve the GitHub issue below with the smallest correct change. You may inspect,
-edit, and test files in /workspace using bash. Work directly on the provided
-checkout copy. Do not use git, commit, push, open pull requests, access the network, or inspect
-credentials. Do not modify .github/workflows, .github/actions, .env files, or
-private-key files. Run the repository's tests after editing.
-
-When the fix is complete and tests have passed, make one final shell action whose
-first output line is exactly COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT. Put a concise
-summary of the change and the tests on the following output lines. For example:
-printf '%s\\n' COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT
-printf '%s\\n' 'Summary: ...' 'Tests: ...'
+Solve the GitHub issue with the smallest correct change. You may inspect, edit,
+and test files in /workspace using bash. Work directly on the provided checkout
+copy. Do not use git, commit, push, open pull requests, access the network, or
+inspect credentials. Do not modify .github/workflows, .github/actions, .env files,
+or private-key files. Run the repository's tests after editing.
 """.strip()
-    instance_template = "{{ task }}"
+    instance_template = """
+Please solve this issue: {{ task }}
+
+You can execute bash commands and edit files to implement the necessary changes.
+
+## Required workflow
+
+1. Inspect only the files relevant to the issue.
+2. Make the smallest reasonable implementation edit by model call 7.
+3. Run the repository tests after editing and fix failures caused by your change.
+4. Stop exploring once the issue is fixed and the tests pass.
+5. Finish with exactly one bash tool call whose command is:
+   `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
+   Do not combine that command with another command.
+
+## Command execution rules
+
+Every response must contain exactly one bash tool call. Use the bash tool with a
+command argument, for example:
+
+```json
+{"command": "rg -n 'pattern' file.py"}
+```
+
+The shell runs in a fresh process for each call, but file changes persist. Do not
+spend the whole budget reading files: after the relevant code is located, edit it.
+""".strip()
     task = (
         f"GitHub issue #{issue['number']}\n"
         f"Title: {issue.get('title', '')}\n\n"

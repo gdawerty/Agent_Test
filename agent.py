@@ -29,6 +29,7 @@ DEFAULT_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_OPENAI_MODEL = "gpt-5.6"
 DEFAULT_ENGINE = "custom"
+DEFAULT_MODEL_CHAIN = ""
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MAX_TOOL_OUTPUT = 8_000
 MAX_FILE_OUTPUT = 8_000
@@ -1024,6 +1025,43 @@ def create_model(provider: str, model: str) -> Model:
     if provider == "openai":
         return OpenAIModel(model)
     raise AgentError(f"Unsupported LLM_PROVIDER: {provider}. Use gemini or openai.")
+
+
+def parse_model_chain(
+    value: str | None,
+    *,
+    default_provider: str,
+    default_model: str,
+) -> list[tuple[str, str]]:
+    """Parse an ordered provider:model fallback chain.
+
+    An empty value preserves the existing single-provider configuration. Each
+    non-empty entry must use ``provider:model`` syntax, for example
+    ``openai:gpt-5.4,openai:gpt-5.4-mini,gemini:gemini-3.5-flash-lite``.
+    """
+    if not value or not value.strip():
+        return [(default_provider.lower(), default_model)]
+
+    candidates: list[tuple[str, str]] = []
+    for raw_candidate in value.split(","):
+        candidate = raw_candidate.strip()
+        if not candidate:
+            continue
+        provider, separator, model = candidate.partition(":")
+        provider = provider.strip().lower()
+        model = model.strip()
+        if not separator or provider not in {"gemini", "openai"} or not model:
+            raise AgentError(
+                "AGENT_MODEL_CHAIN entries must use provider:model syntax with "
+                "provider gemini or openai"
+            )
+        item = (provider, model)
+        if item not in candidates:
+            candidates.append(item)
+
+    if not candidates:
+        raise AgentError("AGENT_MODEL_CHAIN must contain at least one model")
+    return candidates
 
 
 def mini_model_name(provider: str, model: str) -> str:
@@ -2069,6 +2107,7 @@ def create_pr(root: Path, issue: dict[str, Any], branch: str, summary: str) -> s
 def build_parser() -> argparse.ArgumentParser:
     provider = os.environ.get("LLM_PROVIDER", DEFAULT_PROVIDER).lower()
     engine = os.environ.get("AGENT_ENGINE", DEFAULT_ENGINE).lower()
+    model_chain = os.environ.get("AGENT_MODEL_CHAIN", DEFAULT_MODEL_CHAIN)
     if engine not in {"custom", "mini"}:
         engine = DEFAULT_ENGINE
     if provider == "openai":
@@ -2112,6 +2151,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Model name (default depends on the provider)",
     )
     parser.add_argument(
+        "--model-chain",
+        default=model_chain,
+        help=(
+            "Ordered provider:model fallbacks, comma-separated "
+            "(default: $AGENT_MODEL_CHAIN or the selected provider/model)"
+        ),
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print selected provider, model, and maximum step count",
@@ -2136,6 +2183,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise AgentError("max_steps must be positive")
 
     budget = RunBudget(args.max_steps)
+    model_chain = parse_model_chain(
+        args.model_chain,
+        default_provider=args.provider,
+        default_model=args.model,
+    )
+    print(
+        "Model chain: "
+        + " -> ".join(f"{provider}/{model}" for provider, model in model_chain)
+    )
 
     root = repository_root(Path.cwd())
     require_clean_worktree(root)
@@ -2153,54 +2209,74 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"Created branch {branch}")
 
     workspace = RepoWorkspace(root)
-    if args.engine == "mini":
-        result = run_mini_agent(
-            root,
-            issue,
-            provider=args.provider,
-            model=args.model,
-            max_steps=min(budget.remaining, MINI_MAX_CALLS),
-            budget=budget,
+    result: AgentResult | None = None
+    attempt_errors: list[str] = []
+    for attempt, (provider, model) in enumerate(model_chain, start=1):
+        if budget.remaining <= 0:
+            break
+        required_key = "GEMINI_API_KEY" if provider == "gemini" else "OPENAI_API_KEY"
+        if not os.environ.get(required_key):
+            message = f"Skipping {provider}/{model}: {required_key} is not set"
+            print(message)
+            attempt_errors.append(message)
+            continue
+
+        print(
+            f"\nModel attempt {attempt}/{len(model_chain)}: "
+            f"{provider}/{model} ({budget.remaining} calls available)"
         )
-        if not has_worktree_changes(root):
-            if not MINI_FALLBACK_ENABLED:
-                raise AgentError(
-                    "mini-SWE-agent made no edit; the fallback tool agent is disabled."
+        try:
+            if args.engine == "mini":
+                result = run_mini_agent(
+                    root,
+                    issue,
+                    provider=provider,
+                    model=model,
+                    max_steps=min(budget.remaining, MINI_MAX_CALLS),
+                    budget=budget,
                 )
-            if budget.remaining <= 0:
-                raise AgentError(
-                    "The global model-call budget was exhausted without an edit; "
-                    "no pull request was created."
+            else:
+                runner = AgentRunner(
+                    workspace,
+                    create_model(provider, model),
+                    max_steps=min(args.max_steps, budget.remaining),
+                    budget=budget,
+                    request_delay=(
+                        float(
+                            os.environ.get(
+                                "LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS
+                            )
+                        )
+                        if provider == "gemini"
+                        else 0.0
+                    ),
                 )
-            print(
-                f"\nMini agent made no edit. Retrying with the focused tool agent "
-                f"using the {budget.remaining} remaining model calls."
-            )
-            runner = AgentRunner(
-                workspace,
-                create_model(args.provider, args.model),
-                max_steps=budget.remaining,
-                budget=budget,
-                request_delay=(
-                    float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
-                    if args.provider == "gemini"
-                    else 0.0
-                ),
-            )
-            result = runner.run(issue)
-    else:
-        runner = AgentRunner(
-            workspace,
-            create_model(args.provider, args.model),
-            max_steps=args.max_steps,
-            budget=budget,
-            request_delay=(
-                float(os.environ.get("LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS))
-                if args.provider == "gemini"
-                else 0.0
-            ),
+                result = runner.run(issue)
+        except Exception as exc:
+            message = f"{provider}/{model} failed: {type(exc).__name__}: {exc}"
+            print(message)
+            attempt_errors.append(message)
+            result = None
+            if budget.remaining > 0:
+                print("Trying the next configured model fallback.")
+            continue
+
+        if has_worktree_changes(root):
+            break
+
+        message = f"{provider}/{model} finished without an edit"
+        print(message)
+        attempt_errors.append(message)
+        result = None
+        if budget.remaining > 0:
+            print("Trying the next configured model fallback.")
+
+    if result is None or not has_worktree_changes(root):
+        details = "\n".join(attempt_errors)
+        raise AgentError(
+            "All configured model attempts failed to produce a change; no pull "
+            f"request was created.\n{details}"
         )
-        result = runner.run(issue)
 
     print("\nAgent finished:")
     print(result.final_message)

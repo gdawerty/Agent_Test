@@ -112,3 +112,10 @@ The Docker container has no network, receives no `GH_TOKEN`, `GITHUB_TOKEN`, `GE
 The mini engine allows investigation through its checkpoint, then rejects non-edit bash commands until it detects a file change. This prevents repeated test, search, and inspection commands from consuming the remaining calls without attempting an implementation.
 
 To try it through GitHub Actions after the local dry run works, add a repository variable named `AGENT_ENGINE` with the value `mini`. The existing `agent-approved` label and environment reviewer gates still apply. Delete the variable or set it to `custom` to return to the current engine.
+
+# Example
+Example usage:
+```bash
+python3 agent.py --issue 123 --max-diff-lines 200
+```
+

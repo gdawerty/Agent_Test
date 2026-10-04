@@ -205,6 +205,16 @@ class AgentTests(unittest.TestCase):
         self.assertNotIn("GH_TOKEN", docker_args)
         self.assertFalse(mini_command_makes_edit("rg -n argparse agent.py"))
         self.assertTrue(mini_command_makes_edit("sed -i 's/old/new/' agent.py"))
+        self.assertFalse(
+            mini_command_makes_edit(
+                "python3 -c 'with open(\"agent.py\", \"r\") as f: f.read()'"
+            )
+        )
+        self.assertTrue(
+            mini_command_makes_edit(
+                "python3 -c 'with open(\"agent.py\", \"a\") as f: f.write(\"x\")'"
+            )
+        )
         self.assertTrue(
             mini_command_allowed(
                 "cat >> agent.py <<'EOF'\nchange\nEOF",

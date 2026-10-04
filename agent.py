@@ -1063,7 +1063,8 @@ def mini_command_makes_edit(command: str) -> bool:
         r"\b(?:cp|mv|rm|tee|touch|mkdir)\b",
         r"(?:cat|echo|printf)\b[^\n;]*>{1,2}",
         r"\bpython(?:\d+(?:\.\d+)?)?\s+(?:-c|-)(?:\s|$).*"
-        r"(?:open\(|write_text|write_bytes|\.write\()",
+        r"(?:write_text|write_bytes|\.write\(|"
+        r"open\([^)]*,\s*(?:mode\s*=\s*)?[\"'](?:r\+|[wax](?:b|\+)?)['\"])",
         r"\bgit\s+(?:apply|checkout|restore)\b",
     )
     return any(re.search(pattern, command, re.IGNORECASE | re.DOTALL) for pattern in patterns)

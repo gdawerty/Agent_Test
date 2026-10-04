@@ -36,7 +36,7 @@ Gemini is the default provider and `gemini-3.5-flash-lite` is the default model.
 ```bash
 export LLM_PROVIDER=openai
 export OPENAI_API_KEY="your-openai-key"
-export OPENAI_MODEL="gpt-5.6"
+export OPENAI_MODEL="gpt-6-luna"
 ```
 
 The repository must have a clean worktree before every run. Use a disposable clone when testing because the agent is allowed to edit files.
@@ -81,13 +81,15 @@ The included workflow supports two triggers:
 1. Run **Actions → Agent fix → Run workflow** and enter an issue number.
 2. Create an issue, review it, and add the `agent-approved` label. The agent then starts automatically for that issue.
 
-Before enabling the workflow, add an Actions repository secret named `GEMINI_API_KEY`. Optionally add `GEMINI_MODEL` as a repository variable. Set `LLM_PROVIDER` to `openai` and add `OPENAI_API_KEY` instead if you want to use OpenAI. The workflow grants the job permission to push branches and create pull requests, and uses the built-in `GH_TOKEN` for GitHub CLI authentication.
+Before enabling the workflow, add an Actions repository secret named `OPENAI_API_KEY` and optionally `GEMINI_API_KEY` as the fallback. The default workflow model chain is `openai:gpt-6-luna,gemini:gemini-3.5-flash-lite`; it uses Luna first and tries Gemini only if the OpenAI attempt fails. You can override the chain with the `AGENT_MODEL_CHAIN` repository variable. The workflow grants the job permission to push branches and create pull requests, and uses the built-in `GH_TOKEN` for GitHub CLI authentication.
 
 Only issues labeled `agent-approved` start an automatic run. The job also uses the `agent-fix` environment. Configure that environment in **Settings → Environments** with yourself or another trusted maintainer as a required reviewer; this adds a second approval gate before the runner receives the workflow credentials.
 
 Protect the `main` branch in **Settings → Rules → Rulesets** or **Settings → Branches**. Require pull requests, at least one approving review, the `CI / test` status check, and no direct pushes or force pushes. Keep automatic merging disabled for agent-created pull requests until a maintainer reviews the diff.
 
 The harness refuses agent edits to workflow, action, credential, and private-key paths. In GitHub Actions, set `AGENT_SANDBOX_TESTS=1` so model-triggered and final tests run in the networkless Docker sandbox instead of on the runner host. The sandbox is read-only except for the checkout and temporary directory, drops capabilities, runs as the checkout owner, and applies CPU, memory, and process limits. The workflow also disables checkout credential persistence and configures push authentication only after validation succeeds. If an issue already has an open automated pull request, a rerun reports that pull request instead of creating a duplicate; a stale branch receives a retry suffix.
+
+The workflows cache pip downloads and Docker BuildKit layers. The sandbox build context contains only `Dockerfile.agent` and `requirements.txt`, so changes to application files do not invalidate the image build. The default twelve-call budget can be changed without editing the workflow by setting the repository variable `AGENT_MAX_STEPS`; keep this bounded because it controls model spend and wall-clock time.
 
 ## Optional mini-SWE-agent engine
 

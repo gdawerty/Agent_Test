@@ -263,13 +263,12 @@ class AgentTests(unittest.TestCase):
     def test_model_chain_preserves_order_and_validates_entries(self):
         self.assertEqual(
             parse_model_chain(
-                "openai:gpt-5.4,openai:gpt-5.4-mini,gemini:gemini-3.5-flash-lite",
+                "openai:gpt-6-luna,gemini:gemini-3.5-flash-lite",
                 default_provider="gemini",
                 default_model="gemini-3.5-flash-lite",
             ),
             [
-                ("openai", "gpt-5.4"),
-                ("openai", "gpt-5.4-mini"),
+                ("openai", "gpt-6-luna"),
                 ("gemini", "gemini-3.5-flash-lite"),
             ],
         )
@@ -277,9 +276,9 @@ class AgentTests(unittest.TestCase):
             parse_model_chain(
                 "",
                 default_provider="openai",
-                default_model="gpt-5.4",
+                default_model="gpt-6-luna",
             ),
-            [("openai", "gpt-5.4")],
+            [("openai", "gpt-6-luna")],
         )
         with self.assertRaises(AgentError):
             parse_model_chain(

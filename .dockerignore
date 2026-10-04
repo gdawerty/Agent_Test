@@ -1,0 +1,6 @@
+# The sandbox image only needs the runtime dependency manifest. Keeping the
+# context small also prevents repository files and local credentials from
+# being sent to the Docker builder.
+*
+!Dockerfile.agent
+!requirements.txt

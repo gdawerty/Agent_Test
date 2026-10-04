@@ -2173,3 +2173,6 @@ if __name__ == "__main__":
     except AgentError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         raise SystemExit(1)
+
+def format_greeting(name):
+    return f"Hello, {name}!"

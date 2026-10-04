@@ -717,3 +717,14 @@ class AgentTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class GreetingTests:
+    def test_format_greeting(self):
+        pass
+
+import unittest
+
+class FormatGreetingTest(unittest.TestCase):
+    def test_format_greeting(self):
+        from agent import format_greeting
+        self.assertEqual(format_greeting("World"), "Hello, World!")

@@ -38,7 +38,7 @@ class ScriptedModel:
     def __init__(self):
         self.calls = 0
 
-    def create(self, *, instructions, input_items, tools):
+    def create(self, *, instructions, input_items, tools, tool_choice=None):
         self.calls += 1
         scripts = [
             ("search_code", {"query": "VALUE"}),
@@ -105,6 +105,7 @@ class AgentTests(unittest.TestCase):
     def test_mini_sandbox_excludes_credentials_and_syncs_safe_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
             (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
             (root / ".env").write_text("TEST_ONLY=placeholder\n", encoding="utf-8")
             sandbox_directory, sandbox_root, before = _prepare_mini_sandbox(root)
@@ -222,19 +223,23 @@ class AgentTests(unittest.TestCase):
     def test_tool_budget_gates_search_and_forces_an_edit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
             (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
 
             class WanderingModel:
                 def __init__(self):
                     self.calls = 0
                     self.available_tools = []
+                    self.tool_choices = []
 
-                def create(self, *, instructions, input_items, tools):
+                def create(self, *, instructions, input_items, tools, tool_choice=None):
                     self.calls += 1
                     self.available_tools.append({tool["name"] for tool in tools})
+                    self.tool_choices.append(tool_choice)
                     scripts = [
                         ("search_code", {"query": "VALUE"}),
                         ("search_code", {"query": "VALUE"}),
+                        ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
                         ("read_file", {"path": "app.py", "start_line": 1, "end_line": 10}),
@@ -272,12 +277,43 @@ class AgentTests(unittest.TestCase):
                 model.available_tools[5], {"read_file", "edit_file"}
             )
             self.assertEqual(
-                model.available_tools[6], {"read_file", "edit_file", "run_tests"}
+                model.available_tools[6], {"edit_file"}
+            )
+            self.assertIsNone(model.tool_choices[5])
+            self.assertEqual(
+                model.tool_choices[6],
+                {"type": "function", "function": {"name": "edit_file"}},
             )
             self.assertEqual(
                 (root / "app.py").read_text(encoding="utf-8"),
                 "VALUE = 'fixed'\n",
             )
+
+    def test_noncompliant_model_fails_at_forced_edit_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+
+            class ReadOnlyModel:
+                def create(self, *, instructions, input_items, tools, tool_choice=None):
+                    return FakeResponse(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": "read_file",
+                                "arguments": json.dumps(
+                                    {"path": "app.py", "start_line": 1, "end_line": 5}
+                                ),
+                                "call_id": "read-only",
+                            }
+                        ]
+                    )
+
+            with self.assertRaisesRegex(AgentError, "only permitted tool is edit_file"):
+                AgentRunner(
+                    RepoWorkspace(root), ReadOnlyModel(), max_steps=7, log=lambda _: None
+                ).run({"number": 10, "title": "Fix value", "body": "Fix it."})
 
     def test_paths_cannot_escape_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -368,7 +404,7 @@ class AgentTests(unittest.TestCase):
             (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
 
             class EditOnlyModel:
-                def create(self, *, instructions, input_items, tools):
+                def create(self, *, instructions, input_items, tools, tool_choice=None):
                     return FakeResponse(
                         output=[
                             {

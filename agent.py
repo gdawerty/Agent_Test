@@ -50,6 +50,7 @@ MINI_MAX_CALLS = 12
 MINI_FALLBACK_ENABLED = False
 MINI_EDIT_DEADLINE_CALL = 4
 MINI_STALL_CALLS = 3
+FINAL_REPAIR_CALLS = 2
 TEST_ENV_ALLOWLIST = {
     "CI",
     "HOME",
@@ -104,6 +105,18 @@ MINI_IGNORED_DIRECTORIES = IGNORED_DIRECTORIES | {
 
 class AgentError(RuntimeError):
     """An expected failure that should be shown as a user-facing CLI error."""
+
+
+class FinalTestError(AgentError):
+    """A final test result that was not successful."""
+
+    def __init__(self, result: dict[str, Any]):
+        self.result = result
+        super().__init__(
+            "The final test run did not pass; no commit or pull request was created.\n"
+            + str(result.get("output", ""))
+            + str(result.get("reason", ""))
+        )
 
 
 class MiniEditDeadlineExceeded(RuntimeError):
@@ -1746,6 +1759,140 @@ class AgentRunner:
             parts.extend(["", "Changed lines:", details])
         return "\n".join(parts)
 
+    def repair_after_failed_tests(
+        self,
+        issue: dict[str, Any],
+        failure_output: str,
+        *,
+        max_steps: int = FINAL_REPAIR_CALLS,
+    ) -> AgentResult:
+        """Apply a small repair after the outer final test run fails.
+
+        The normal agent loop already has an internal repair phase. This is a
+        separate, bounded repair for failures discovered by the authoritative
+        final test run after the agent has returned. It receives the failure
+        output, cannot search the repository, and stops as soon as it applies
+        one edit. The caller reruns the final tests afterward.
+        """
+        budget = self.budget or RunBudget(max_steps)
+        step_limit = min(max_steps, budget.remaining)
+        if step_limit <= 0:
+            raise AgentError("No model-call budget remains for final repair")
+
+        changed_files = _run_process(
+            ["git", "status", "--short", "--untracked-files=all"],
+            cwd=self.workspace.root,
+            check=False,
+        ).strip()
+        input_items: list[Any] = [
+            {
+                "role": "user",
+                "content": (
+                    f"GitHub issue #{issue['number']}\n"
+                    f"Title: {issue.get('title', '')}\n\n"
+                    f"Description:\n{issue.get('body') or '(no issue description)'}\n\n"
+                    "The agent already edited the repository, but the authoritative "
+                    "final validation failed. Repair only the current change.\n\n"
+                    f"Changed files:\n{changed_files or '(not available)'}\n\n"
+                    f"Final test failure:\n{_truncate(failure_output, MAX_TOOL_OUTPUT)}\n\n"
+                    "Use a focused read_file call only if needed to correct the exact "
+                    "edit, then call edit_file. Do not search unrelated code. The "
+                    "outer harness will rerun the final tests after your edit."
+                ),
+            }
+        ]
+        edit_made = False
+
+        for step in range(1, step_limit + 1):
+            self.log(f"\n--- Final repair call {step} ---")
+            allowed_tool_names = (
+                {"read_file", "edit_file"} if not edit_made else {"edit_file"}
+            )
+            allowed_tools = [
+                tool
+                for tool in TOOLS
+                if tool["name"] in allowed_tool_names
+            ]
+            instructions = (
+                f"{SYSTEM_PROMPT}\n\n"
+                "FINAL REPAIR PHASE:\n"
+                f"This is focused repair call {step} of {step_limit}.\n"
+                "The final test output is included in the user message. Do not use "
+                "search_code, inspect unrelated files, or run tests yourself. Apply "
+                "the smallest edit that addresses the reported failure. "
+                "Call edit_file now, using read_file only when the exact replacement "
+                "needs confirmation."
+            )
+            request: dict[str, Any] = {
+                "instructions": instructions,
+                "input_items": input_items,
+                "tools": allowed_tools,
+            }
+            if step > 1:
+                request["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": "edit_file"},
+                }
+            budget.consume(phase="final_repair")
+            response = self.model.create(**request)
+            output_items = list(_item_value(response, "output", []) or [])
+            input_items.extend(output_items)
+            tool_calls = [
+                item
+                for item in output_items
+                if _item_value(item, "type") == "function_call"
+            ]
+            if not tool_calls:
+                input_items.append(
+                    {
+                        "role": "user",
+                        "content": "Apply the focused fix now with edit_file.",
+                    }
+                )
+                continue
+
+            for call in tool_calls:
+                name = _item_value(call, "name")
+                raw_arguments = _item_value(call, "arguments", "{}")
+                call_id = _item_value(call, "call_id")
+                self.log(f"Tool: {name}({raw_arguments})")
+                if name not in allowed_tool_names:
+                    result = (
+                        f"TOOL ERROR: {name} is unavailable during final repair; "
+                        "use read_file or edit_file."
+                    )
+                else:
+                    try:
+                        arguments = json.loads(raw_arguments)
+                        if not isinstance(arguments, dict):
+                            raise ValueError("tool arguments must be a JSON object")
+                        result = self.workspace.call_tool(name, arguments)
+                    except Exception as exc:
+                        result = f"TOOL ERROR: {type(exc).__name__}: {exc}"
+                if name == "edit_file" and result.startswith(
+                    ("Successfully edited", "Successfully created")
+                ):
+                    edit_made = True
+                self.log(_truncate(result, 1_000))
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": result,
+                    }
+                )
+
+            if edit_made:
+                summary = _item_value(response, "output_text", "") or (
+                    "Applied a focused repair after final validation failed."
+                )
+                return AgentResult(str(summary), step)
+
+        raise AgentError(
+            "The focused final repair did not make an edit after "
+            f"{step_limit} model calls"
+        )
+
     def run(self, issue: dict[str, Any]) -> AgentResult:
         issue_number = issue["number"]
         title = issue.get("title", "")
@@ -2191,11 +2338,7 @@ def final_test_status(workspace: RepoWorkspace) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"status": "failed", "output": raw}
     if result.get("status") != "passed":
-        raise AgentError(
-            "The final test run did not pass; no commit or pull request was created.\n"
-            + str(result.get("output", ""))
-            + str(result.get("reason", ""))
-        )
+        raise FinalTestError(result)
     return result
 
 
@@ -2349,6 +2492,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     workspace = RepoWorkspace(root)
     result: AgentResult | None = None
     attempt_errors: list[str] = []
+    selected_provider: str | None = None
+    selected_model: str | None = None
     for attempt, (provider, model) in enumerate(model_chain, start=1):
         if budget.remaining <= 0:
             break
@@ -2363,6 +2508,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"\nModel attempt {attempt}/{len(model_chain)}: "
             f"{provider}/{model} ({budget.remaining} calls available)"
         )
+        selected_provider = provider
+        selected_model = model
         try:
             if args.engine == "mini":
                 result = run_mini_agent(
@@ -2419,7 +2566,61 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("\nAgent finished:")
     print(result.final_message)
     validate_agent_changes(root)
-    test_result = final_test_status(workspace)
+    repair_result: AgentResult | None = None
+    try:
+        test_result = final_test_status(workspace)
+    except FinalTestError as final_test_error:
+        if final_test_error.result.get("status") != "failed":
+            raise
+        if selected_provider is None or selected_model is None:
+            raise
+        if budget.remaining <= 0:
+            raise AgentError(
+                "Final validation failed and no model-call budget remains for "
+                "focused repair; no pull request was created.\n"
+                + str(final_test_error)
+            ) from final_test_error
+
+        repair_steps = min(FINAL_REPAIR_CALLS, budget.remaining)
+        print(
+            "\nFinal validation failed; starting focused repair with "
+            f"up to {repair_steps} model calls."
+        )
+        repair_runner = AgentRunner(
+            workspace,
+            create_model(selected_provider, selected_model),
+            max_steps=repair_steps,
+            budget=budget,
+            request_delay=(
+                float(
+                    os.environ.get(
+                        "LLM_REQUEST_DELAY", GEMINI_REQUEST_DELAY_SECONDS
+                    )
+                )
+                if selected_provider == "gemini"
+                else 0.0
+            ),
+        )
+        try:
+            repair_result = repair_runner.repair_after_failed_tests(
+                issue,
+                str(final_test_error),
+                max_steps=repair_steps,
+            )
+            validate_agent_changes(root)
+            test_result = final_test_status(workspace)
+        except AgentError as repair_error:
+            raise AgentError(
+                "Final validation still failed after focused repair; no pull "
+                "request was created.\n"
+                + str(repair_error)
+            ) from repair_error
+
+        result = AgentResult(
+            f"{result.final_message}\n\n"
+            f"Focused repair summary:\n{repair_result.final_message}",
+            result.steps + repair_result.steps,
+        )
     print(f"\nFinal tests: {json.dumps(test_result)}")
 
     if args.dry_run:

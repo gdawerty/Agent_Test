@@ -148,6 +148,73 @@ class AgentTests(unittest.TestCase):
             self.assertEqual(model.calls, 2)
             self.assertEqual(budget.model_calls_used, 2)
 
+    def test_final_repair_uses_failure_context_and_retests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            tests = root / "tests"
+            tests.mkdir()
+            (tests / "test_app.py").write_text(
+                "import unittest\n"
+                "from app import VALUE\n\n"
+                "class AppTests(unittest.TestCase):\n"
+                "    def test_value(self):\n"
+                "        self.assertEqual(VALUE, 'fixed')\n",
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(AgentError) as failure:
+                final_test_status(RepoWorkspace(root))
+
+            class RepairModel:
+                def __init__(self):
+                    self.calls = 0
+                    self.tool_sets = []
+                    self.inputs = []
+
+                def create(
+                    self, *, instructions, input_items, tools, tool_choice=None
+                ):
+                    self.calls += 1
+                    self.tool_sets.append({tool["name"] for tool in tools})
+                    self.inputs.append(input_items[0]["content"])
+                    return FakeResponse(
+                        output=[
+                            {
+                                "type": "function_call",
+                                "name": "edit_file",
+                                "arguments": json.dumps(
+                                    {
+                                        "path": "app.py",
+                                        "old_text": "VALUE = 'bug'\n",
+                                        "new_text": "VALUE = 'fixed'\n",
+                                    }
+                                ),
+                                "call_id": "repair-1",
+                            }
+                        ],
+                        output_text="Updated the value to satisfy the failing test.",
+                    )
+
+            model = RepairModel()
+            budget = RunBudget(2)
+            repair = AgentRunner(
+                RepoWorkspace(root), model, budget=budget, log=lambda _: None
+            ).repair_after_failed_tests(
+                {"number": 14, "title": "Fix value", "body": "Use fixed."},
+                str(failure.exception),
+            )
+
+            result = final_test_status(RepoWorkspace(root))
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(model.calls, 1)
+            self.assertEqual(model.tool_sets[0], {"read_file", "edit_file"})
+            self.assertIn("Final test failure:", model.inputs[0])
+            self.assertIn("Fix value", model.inputs[0])
+            self.assertIn("Updated the value", repair.final_message)
+            self.assertEqual(budget.model_calls_used, 1)
+
     def test_repository_index_maps_symbols_and_excludes_secrets(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

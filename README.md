@@ -15,6 +15,8 @@ The agent has twelve paced model calls by default and receives its current phase
 
 The default custom phase budgets are 4 investigation calls, 3 implementation calls, 3 repair calls, and 2 verification/finalization calls. Repeated identical reads or searches are reported as already observed. The current mini-engine experiment allows up to 12 model calls and disables the custom fallback, so a mini run that makes no edit fails without opening a pull request.
 
+After the agent returns, the harness runs the authoritative final test command. If that run fails and model-call budget remains, the active model receives up to two focused repair calls with the failure output and the changed-file list. It can read or edit the current patch but cannot search broadly; the harness reruns the final tests after the repair. Skipped tests still block pull-request creation.
+
 The harness also limits exploration: the custom tool agent gets at most two code searches, loses search access after editing, and can use targeted reads during the investigation phase. Starting at the implementation checkpoint, the provider is explicitly asked for `edit_file` and receives no read or search tool. If an exact replacement fails, one recovery turn can read the affected code before the next edit attempt. The mini engine runs in its own bounded Docker workflow and the current experiment does not invoke the custom fallback.
 
 `search_code` returns line numbers with nearby context, and `read_file` requires a focused line range capped at 200 lines. The AST map lets the agent jump directly to likely symbols and relevant tests instead of spending turns discovering repository structure. Indexes are cached by checkout revision for the lifetime of the process.

@@ -19,6 +19,8 @@ from agent import (
     _prepare_mini_sandbox,
     _mini_snapshot,
     _sync_mini_sandbox,
+    _fallback_change_summary,
+    _is_generic_agent_submission,
     build_repository_index,
     find_open_issue_pr,
     final_test_status,
@@ -347,6 +349,39 @@ class AgentTests(unittest.TestCase):
                 (root / "app.py").read_text(encoding="utf-8"),
                 "VALUE = 'fixed'\n",
             )
+
+    def test_generic_mini_submission_gets_useful_change_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True)
+            (root / "app.py").write_text("VALUE = 'bug'\n", encoding="utf-8")
+            subprocess.run(["git", "add", "app.py"], cwd=root, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-m",
+                    "initial",
+                ],
+                cwd=root,
+                check=True,
+                capture_output=True,
+            )
+            (root / "app.py").write_text("VALUE = 'fixed'\n", encoding="utf-8")
+            (root / "new_file.py").write_text("FLAG = True\n", encoding="utf-8")
+
+            summary = _fallback_change_summary(root, status="Submitted", calls=5)
+
+            self.assertTrue(_is_generic_agent_submission("Submitted"))
+            self.assertFalse(_is_generic_agent_submission("Changed the test command"))
+            self.assertIn("`app.py`", summary)
+            self.assertIn("`new_file.py`", summary)
+            self.assertIn("removed: VALUE = 'bug'", summary)
+            self.assertIn("added: VALUE = 'fixed'", summary)
 
     def test_worktree_change_detection_includes_untracked_files(self):
         with tempfile.TemporaryDirectory() as directory:

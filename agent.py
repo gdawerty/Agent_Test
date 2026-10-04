@@ -1365,6 +1365,60 @@ def _sync_mini_sandbox(
         )
 
 
+def _is_generic_agent_submission(summary: str) -> bool:
+    """Return whether a model submission contains no useful explanation."""
+    normalized = re.sub(r"[^a-z]+", " ", summary.lower()).strip()
+    return normalized in {
+        "complete",
+        "completed",
+        "done",
+        "success",
+        "submitted",
+        "task complete",
+        "task completed",
+    }
+
+
+def _fallback_change_summary(root: Path, *, status: str, calls: int) -> str:
+    """Build a useful PR summary when the inner agent returns a placeholder."""
+    display_status = (
+        "completed"
+        if status.lower() in {"submitted", "success", "completed"}
+        else status
+    )
+    changed_paths = sorted(_changed_paths(root))
+    stat = _run_process(["git", "diff", "--stat"], cwd=root, check=False).strip()
+    diff = _run_process(
+        ["git", "diff", "--no-ext-diff", "--unified=0"],
+        cwd=root,
+        check=False,
+    )
+    changed_lines = [
+        line
+        for line in diff.splitlines()
+        if (line.startswith("+") or line.startswith("-"))
+        and not line.startswith(("+++", "---"))
+    ]
+    details = "\n".join(
+        f"- {'added' if line.startswith('+') else 'removed'}: "
+        f"{_truncate(line[1:].strip(), 240)}"
+        for line in changed_lines[:20]
+    )
+    if len(changed_lines) > 20:
+        details += f"\n- ... {len(changed_lines) - 20} more changed lines"
+
+    files = "\n".join(f"- `{path}`" for path in changed_paths)
+    return (
+        f"Mini-SWE-agent {display_status} after {calls} model calls.\n\n"
+        "Changed files:\n"
+        f"{files or '- (no changed files detected)'}\n\n"
+        "Diff statistics:\n"
+        f"{stat or '(no tracked-file statistics)'}\n\n"
+        "Implementation details from the patch:\n"
+        f"{details or '- (no line-level diff available)'}"
+    )
+
+
 def run_mini_agent(
     root: Path,
     issue: dict[str, Any],
@@ -1541,7 +1595,8 @@ You can execute bash commands and edit files to implement the necessary changes.
    do not spend the whole budget rereading the same code.
 3. Run the repository tests after editing and fix failures caused by your change.
 4. Stop exploring once the issue is fixed and the tests pass.
-5. Finish with exactly one bash tool call whose command is:
+5. In your final response, briefly summarize what you changed and which tests passed.
+6. Finish with exactly one bash tool call whose command is:
    `echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`
    Do not combine that command with another command.
 
@@ -1620,18 +1675,11 @@ spend the whole budget reading files: after the relevant code is located, edit i
 
     status = str(outcome.get("exit_status") or "unknown")
     submission = str(outcome.get("submission") or "").strip()
-    if submission:
-        summary = submission
-    else:
-        changed = _run_process(
-            ["git", "diff", "--stat"], cwd=root, check=False
-        ).strip()
-        summary = (
-            f"mini-SWE-agent stopped with status {status} after {agent.n_calls} "
-            "model calls.\n\n"
-            f"Changed files:\n{changed or '(no tracked-file diff reported)'}\n\n"
-            "The harness will run the final tests before creating a pull request."
-        )
+    summary = (
+        submission
+        if submission and not _is_generic_agent_submission(submission)
+        else _fallback_change_summary(root, status=status, calls=agent.n_calls)
+    )
     return AgentResult(summary, agent.n_calls)
 
 
